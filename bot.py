@@ -17,7 +17,7 @@ VK_TOKEN = os.environ.get(
 
 GROUP_ID = 241841230
 
-SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzmFzLwaTmBu9DOTUEh220wd4DX6jd2_sJqzBujpwWoz9m29pQlc3UcT3ebOij6mOqG/exec"
+SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwyxTMoKk5wCeZXtTExMEGO3U0ZD5sj5_-dZYf5vDaKhBbQDnvTdMRN-dJIxYIqNZQ_/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
 SCRIPT_SECRET = "724422"
@@ -301,6 +301,71 @@ def cmd_list(args):
     return call_sheet({"action": "list"})
 
 # ==========================================================
+# РАЗОСЛАТЬ
+# ==========================================================
+
+def cmd_broadcast(raw_text):
+
+    parts = raw_text.strip().split(maxsplit=1)
+
+    if len(parts) < 2 or not parts[1].strip():
+
+        return "Формат: /разослать текст"
+
+    message = parts[1].strip()
+
+    text, data = call_sheet_ex({"action": "all_links"})
+
+    if data is None:
+
+        return text
+
+    ids = []
+
+    for link in data.get("links", []):
+
+        m = re.search(r"vk\.com/id(\d+)", link)
+
+        if m:
+
+            ids.append(int(m.group(1)))
+
+    # убрать повторы, сохранив порядок
+    ids = list(dict.fromkeys(ids))
+
+    if not ids:
+
+        return "В таблице нет пользователей для рассылки."
+
+    sent = 0
+    failed = 0
+
+    for uid in ids:
+
+        try:
+
+            vk.messages.send(
+                user_id=uid,
+                message=message,
+                random_id=0
+            )
+
+            sent += 1
+
+        except Exception as e:
+
+            failed += 1
+
+            print(f"Рассылка: не удалось отправить {uid}:", repr(e))
+
+        time.sleep(0.1)
+
+    return (
+        f"Рассылка завершена. "
+        f"Отправлено: {sent}, не доставлено: {failed}."
+    )
+
+# ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
 
@@ -453,6 +518,10 @@ def handle(text, user_id):
 
         return cmd_shop_remove(args)
 
+    if command == "/разослать":
+
+        return cmd_broadcast(text)
+
     return None
 
 # ==========================================================
@@ -520,6 +589,10 @@ def process_event(event):
 
             public_answer = cmd_buy(args, from_id)
 
+        elif command == "/я":
+
+            public_answer = f"Ваш VK ID: {from_id}"
+
         else:
 
             is_public = False
@@ -540,11 +613,10 @@ def process_event(event):
 
     # ======================================================
     # ВСЕ ОСТАЛЬНЫЕ КОМАНДЫ — только ALLOWED_IDS
+    # Остальным бот молчит
     # ======================================================
 
     if from_id not in ALLOWED_IDS:
-
-        reply(peer_id, f"Нет доступа. Ваш id: {from_id}")
 
         return
 
