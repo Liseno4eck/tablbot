@@ -17,7 +17,7 @@ VK_TOKEN = os.environ.get(
 
 GROUP_ID = 241841230
 
-SCRIPT_URL = "https://script.google.com/macros/s/AKfycbwyxTMoKk5wCeZXtTExMEGO3U0ZD5sj5_-dZYf5vDaKhBbQDnvTdMRN-dJIxYIqNZQ_/exec"
+SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxMJacAakmrKkpSOQNe2UqLxhYTKt0HOn973wpVbcoWMAYXaYXZt3csoAldQI5WpH9Z/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
 SCRIPT_SECRET = "724422"
