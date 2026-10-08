@@ -1,23 +1,23 @@
 import os
 import re
 import time
+import threading
 import requests
 import vk_api
 
+from concurrent.futures import ThreadPoolExecutor
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
 # ==========================================================
 # НАСТРОЙКИ
 # ==========================================================
 
-VK_TOKEN = os.environ.get(
-    "VK_TOKEN",
-    "vk1.a._74jNUH2XsupAUEs4x9E77nW5dOFjH4W8_fnoLzl9Aq5weI3PG6rOCiFIOJTq0HxxuTWwrsN13LsSDyiQYLB0r9oXg5ychaqmrySRp76k4_RGnQjo94fsIWw3lEOBhhDSo8p9ugMehGZMl4mGSEFgmjacafPAHLlQxSqz1PO6msQWXb7MWQIQjMbinOTB6duGmJCnykldQBot2b5_0xOJA"
-).strip().strip('"').strip("'")
+# ВСТАВЬ НОВЫЙ токен (старый засветился в чате — отзови его в настройках сообщества)
+VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a._74jNUH2XsupAUEs4x9E77nW5dOFjH4W8_fnoLzl9Aq5weI3PG6rOCiFIOJTq0HxxuTWwrsN13LsSDyiQYLB0r9oXg5ychaqmrySRp76k4_RGnQjo94fsIWw3lEOBhhDSo8p9ugMehGZMl4mGSEFgmjacafPAHLlQxSqz1PO6msQWXb7MWQIQjMbinOTB6duGmJCnykldQBot2b5_0xOJA").strip().strip('"').strip("'")
 
 GROUP_ID = 241841230
 
-SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxMJacAakmrKkpSOQNe2UqLxhYTKt0HOn973wpVbcoWMAYXaYXZt3csoAldQI5WpH9Z/exec"
+SCRIPT_URL = "https://script.google.com/macros/s/AKfycbykzQWDnA468hYkYxXGqpfsdMSdugfekql11RNunw6vfw1Eu39uElFSaw3My8xza0Gw/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
 SCRIPT_SECRET = "724422"
@@ -31,142 +31,143 @@ ALLOWED_IDS = {
 
 DEBUG = False
 
+# Таймаут запроса к таблице (сек) и интервал "прогрева" скрипта
+SHEET_TIMEOUT = 25
+KEEPALIVE_INTERVAL = 240
+
+# Действия, которые только читают (их безопасно повторять при таймауте)
+READ_ACTIONS = {"list", "my_points", "all_links", "shop_list", "ping"}
+
 # ==========================================================
 # ПОДКЛЮЧЕНИЕ К VK
 # ==========================================================
 
 vk_session = vk_api.VkApi(token=VK_TOKEN)
-
 vk = vk_session.get_api()
 
 # ==========================================================
-# HTTP-СЕССИЯ
+# HTTP-СЕССИЯ (keep-alive, пул соединений)
 # ==========================================================
 
 http = requests.Session()
+http.headers.update({"Content-Type": "application/json"})
 
-http.headers.update({
-    "Content-Type": "application/json"
-})
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20)
+http.mount("https://", adapter)
+
+executor = ThreadPoolExecutor(max_workers=8)
 
 # ==========================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
 
 def reply(peer_id, text):
-
     try:
-
-        vk.messages.send(
-            peer_id=peer_id,
-            message=str(text),
-            random_id=0
-        )
-
+        vk.messages.send(peer_id=peer_id, message=str(text), random_id=0)
     except Exception as e:
-
         print("Ошибка отправки сообщения:", repr(e))
 
 
 def notify_admins(text):
-
     for admin_id in ALLOWED_IDS:
-
         try:
-
-            vk.messages.send(
-                user_id=admin_id,
-                message=text,
-                random_id=0
-            )
-
+            vk.messages.send(user_id=admin_id, message=text, random_id=0)
         except Exception as e:
-
             print(f"Не удалось написать {admin_id}:", repr(e))
 
 # ==========================================================
 # ЗАПРОС В GOOGLE APPS SCRIPT
 # ==========================================================
 
+def _post_once(payload):
+    return http.post(
+        SCRIPT_URL,
+        json=payload,
+        timeout=(5, SHEET_TIMEOUT),
+        allow_redirects=True
+    )
+
+
 def call_sheet_ex(payload):
     """Возвращает (текст_ответа, данные_или_None)."""
 
     payload["secret"] = SCRIPT_SECRET
 
-    try:
+    is_read = payload.get("action") in READ_ACTIONS
+    attempts = 2 if is_read else 1
 
-        response = http.post(
-            SCRIPT_URL,
-            json=payload,
-            timeout=15,
-            allow_redirects=True
-        )
+    response = None
 
-        if DEBUG:
-
-            print("Apps Script HTTP:", response.status_code)
-            print("Apps Script response:", response.text[:2000])
-
-        if response.status_code != 200:
-
-            print(
-                "Apps Script HTTP ошибка:",
-                response.status_code,
-                response.text[:1000]
-            )
-
-            return (f"Ошибка таблицы. HTTP {response.status_code}", None)
-
-        raw = response.text.strip().lstrip("\ufeff")
-
-        if not raw:
-
-            return ("Таблица вернула пустой ответ.", None)
+    for attempt in range(attempts):
 
         try:
+            response = _post_once(payload)
+            break
 
-            data = response.json()
+        except (requests.Timeout, requests.ConnectionError) as e:
 
-        except ValueError:
+            print(f"Таблица: попытка {attempt + 1} не удалась:", repr(e))
 
-            print("Apps Script вернул НЕ JSON:")
-            print(raw[:2000])
+            if attempt == attempts - 1:
 
-            return (
-                "Ошибка ответа таблицы. Проверьте SCRIPT_URL "
-                "и развёртывание Apps Script.",
-                None
-            )
+                if isinstance(e, requests.Timeout):
+                    return ("Таблица отвечает слишком долго. Попробуйте ещё раз.", None)
 
-        if data.get("ok") is False:
+                return ("Не удалось связаться с таблицей.", None)
 
-            return (
-                str(data.get("message", "Неизвестная ошибка таблицы.")),
-                None
-            )
+        except requests.RequestException as e:
+            print("Ошибка соединения с таблицей:", repr(e))
+            return ("Не удалось связаться с таблицей.", None)
 
-        message = data.get("message")
+    if DEBUG:
+        print("Apps Script HTTP:", response.status_code)
+        print("Apps Script response:", response.text[:2000])
 
-        if message is not None:
+    if response.status_code != 200:
+        print("Apps Script HTTP ошибка:", response.status_code, response.text[:1000])
+        return (f"Ошибка таблицы. HTTP {response.status_code}", None)
 
-            return (str(message), data)
+    raw = response.text.strip().lstrip("\ufeff")
 
+    if not raw:
         return ("Таблица вернула пустой ответ.", None)
 
-    except requests.Timeout:
+    try:
+        data = response.json()
+    except ValueError:
+        print("Apps Script вернул НЕ JSON:")
+        print(raw[:2000])
+        return (
+            "Ошибка ответа таблицы. Проверьте SCRIPT_URL "
+            "и развёртывание Apps Script.",
+            None
+        )
 
-        return ("Таблица отвечает слишком долго. Попробуйте ещё раз.", None)
+    if data.get("ok") is False:
+        return (str(data.get("message", "Неизвестная ошибка таблицы.")), None)
 
-    except requests.RequestException as e:
+    message = data.get("message")
 
-        print("Ошибка соединения с таблицей:", repr(e))
+    if message is not None:
+        return (str(message), data)
 
-        return ("Не удалось связаться с таблицей.", None)
+    return ("Таблица вернула пустой ответ.", None)
 
 
 def call_sheet(payload):
-
     return call_sheet_ex(payload)[0]
+
+# ==========================================================
+# ПРОГРЕВ APPS SCRIPT (чтобы не "засыпал")
+# ==========================================================
+
+def keepalive_loop():
+    while True:
+        try:
+            call_sheet_ex({"action": "ping"})
+        except Exception as e:
+            print("Keepalive:", repr(e))
+        time.sleep(KEEPALIVE_INTERVAL)
 
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
@@ -175,15 +176,12 @@ def call_sheet(payload):
 def cmd_give(args, sign):
 
     if len(args) != 2 or not re.fullmatch(r"\d+", args[1]):
-
         command = "/выдать" if sign > 0 else "/забрать"
-
         return f"Формат: {command} Nick_Name 5"
 
     amount = int(args[1])
 
     if amount <= 0:
-
         return "Количество баллов должно быть больше 0."
 
     return call_sheet({
@@ -203,29 +201,23 @@ def resolve_user(raw):
     match = re.fullmatch(r"\[id(\d+)\|.*\]", raw)
 
     if match:
-
         return int(match.group(1))
 
     username = raw.lstrip("@").strip()
 
     if not username:
-
         return None
 
     try:
-
         users = vk.users.get(user_ids=username)
 
         if not users:
-
             return None
 
         return users[0]["id"]
 
     except vk_api.ApiError as e:
-
         print("Ошибка поиска VK:", repr(e))
-
         return None
 
 # ==========================================================
@@ -235,11 +227,7 @@ def resolve_user(raw):
 def cmd_bind(args):
 
     if len(args) != 4:
-
-        return (
-            "Формат:\n"
-            "/привязать @username Nick_Name по 25/09"
-        )
+        return "Формат:\n/привязать @username Nick_Name по 25/09"
 
     username = args[0]
     nick = args[1]
@@ -247,17 +235,14 @@ def cmd_bind(args):
     date = args[3]
 
     if position not in ("по", "зо"):
-
         return "Должность должна быть «по» или «зо»."
 
     if not re.fullmatch(r"\d{2}/\d{2}", date):
-
         return "Дата должна быть в формате дд/мм."
 
     user_id = resolve_user(username)
 
     if user_id is None:
-
         return f"Пользователь {username} не найден в VK."
 
     return call_sheet({
@@ -275,13 +260,11 @@ def cmd_bind(args):
 def cmd_remove(args):
 
     if len(args) != 1:
-
         return "Формат: /убрать @username"
 
     user_id = resolve_user(args[0])
 
     if user_id is None:
-
         return f"Пользователь {args[0]} не найден в VK."
 
     return call_sheet({
@@ -296,7 +279,6 @@ def cmd_remove(args):
 def cmd_list(args):
 
     if args:
-
         return "Формат: /список"
 
     return call_sheet({"action": "list"})
@@ -310,7 +292,6 @@ def cmd_broadcast(raw_text):
     parts = raw_text.strip().split(maxsplit=1)
 
     if len(parts) < 2 or not parts[1].strip():
-
         return "Формат: /разослать текст"
 
     message = parts[1].strip()
@@ -318,24 +299,19 @@ def cmd_broadcast(raw_text):
     text, data = call_sheet_ex({"action": "all_links"})
 
     if data is None:
-
         return text
 
     ids = []
 
     for link in data.get("links", []):
-
         m = re.search(r"vk\.com/id(\d+)", link)
-
         if m:
-
             ids.append(int(m.group(1)))
 
     # убрать повторы, сохранив порядок
     ids = list(dict.fromkeys(ids))
 
     if not ids:
-
         return "В таблице нет пользователей для рассылки."
 
     sent = 0
@@ -344,27 +320,16 @@ def cmd_broadcast(raw_text):
     for uid in ids:
 
         try:
-
-            vk.messages.send(
-                user_id=uid,
-                message=message,
-                random_id=0
-            )
-
+            vk.messages.send(user_id=uid, message=message, random_id=0)
             sent += 1
 
         except Exception as e:
-
             failed += 1
-
             print(f"Рассылка: не удалось отправить {uid}:", repr(e))
 
         time.sleep(0.1)
 
-    return (
-        f"Рассылка завершена. "
-        f"Отправлено: {sent}, не доставлено: {failed}."
-    )
+    return f"Рассылка завершена. Отправлено: {sent}, не доставлено: {failed}."
 
 # ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
@@ -407,22 +372,40 @@ ADMIN_HELP = (
 
 
 def cmd_help(user_id):
-
     return ADMIN_HELP if user_id in ALLOWED_IDS else USER_HELP
 
 # ==========================================================
-# МАГАЗИН
+# МАГАЗИН (с кэшем на 30 сек)
 # ==========================================================
+
+SHOP_CACHE_TTL = 30
+_shop_cache = {"text": None, "time": 0.0}
+
+
+def shop_cache_clear():
+    _shop_cache["text"] = None
+
 
 def cmd_shop():
 
-    return call_sheet({"action": "shop_list"})
+    now = time.time()
+
+    if _shop_cache["text"] and now - _shop_cache["time"] < SHOP_CACHE_TTL:
+        return _shop_cache["text"]
+
+    text, data = call_sheet_ex({"action": "shop_list"})
+
+    # кэшируем только успешный ответ
+    if data is not None:
+        _shop_cache["text"] = text
+        _shop_cache["time"] = now
+
+    return text
 
 
 def cmd_buy(args, user_id):
 
     if len(args) != 1 or not re.fullmatch(r"\d+", args[0]):
-
         return "Формат: /купить 1"
 
     text, data = call_sheet_ex({
@@ -434,8 +417,9 @@ def cmd_buy(args, user_id):
     purchase = (data or {}).get("purchase")
 
     if purchase:
-
-        notify_admins(
+        # уведомление админам в отдельном потоке, чтобы не задерживать ответ игроку
+        executor.submit(
+            notify_admins,
             f"[id{user_id}|@{purchase['nick']}] "
             f"({purchase['nick']}) купил №{purchase['num']}: "
             f"{purchase['item']} ({purchase['price']} баллов). "
@@ -448,32 +432,37 @@ def cmd_buy(args, user_id):
 def cmd_shop_add(args):
 
     if len(args) < 2 or not re.fullmatch(r"\d+", args[0]):
-
         return "Формат: /+магазин 100 что выдать"
 
     price = int(args[0])
 
     if price <= 0:
-
         return "Цена должна быть больше 0."
 
-    return call_sheet({
+    result = call_sheet({
         "action": "shop_add",
         "price": price,
         "name": " ".join(args[1:])
     })
 
+    shop_cache_clear()
+
+    return result
+
 
 def cmd_shop_remove(args):
 
     if len(args) != 1 or not re.fullmatch(r"\d+", args[0]):
-
         return "Формат: /-магазин 3"
 
-    return call_sheet({
+    result = call_sheet({
         "action": "shop_remove",
         "item": int(args[0])
     })
+
+    shop_cache_clear()
+
+    return result
 
 # ==========================================================
 # ОБРАБОТКА АДМИНСКИХ КОМАНД
@@ -484,43 +473,33 @@ def handle(text, user_id):
     parts = text.strip().split()
 
     if not parts:
-
         return None
 
     command = parts[0].lower()
-
     args = parts[1:]
 
     if command == "/выдать":
-
         return cmd_give(args, +1)
 
     if command == "/забрать":
-
         return cmd_give(args, -1)
 
     if command == "/привязать":
-
         return cmd_bind(args)
 
     if command == "/убрать":
-
         return cmd_remove(args)
 
     if command == "/список":
-
         return cmd_list(args)
 
     if command == "/+магазин":
-
         return cmd_shop_add(args)
 
     if command == "/-магазин":
-
         return cmd_shop_remove(args)
 
     if command == "/разослать":
-
         return cmd_broadcast(text)
 
     return None
@@ -532,108 +511,87 @@ def handle(text, user_id):
 def process_event(event):
 
     if DEBUG:
-
         print("Событие:", event.type)
 
     if event.type != VkBotEventType.MESSAGE_NEW:
-
         return
 
     msg = event.obj.message
 
     text = msg.get("text", "").strip()
-
     peer_id = msg["peer_id"]
-
     from_id = msg["from_id"]
 
     if DEBUG:
-
         print(f"Сообщение от {from_id}: {text!r}")
 
     if not text.startswith("/"):
-
         return
 
     # ======================================================
     # ПУБЛИЧНЫЕ КОМАНДЫ (доступны всем)
-    # Проверяются ДО ALLOWED_IDS
     # ======================================================
 
     parts = text.split()
-
     command = parts[0].lower()
-
     args = parts[1:]
 
     is_public = True
-
     public_answer = None
 
     try:
 
         if command == "/баллы":
-
-            public_answer = (
-                "Формат: /баллы" if args else cmd_points(from_id)
-            )
+            public_answer = "Формат: /баллы" if args else cmd_points(from_id)
 
         elif command in ("/help", "/хелп"):
-
             public_answer = cmd_help(from_id)
 
         elif command == "/магазин":
-
             public_answer = cmd_shop()
 
         elif command == "/купить":
-
             public_answer = cmd_buy(args, from_id)
 
         elif command == "/я":
-
             public_answer = f"Ваш VK ID: {from_id}"
 
         else:
-
             is_public = False
 
     except Exception as e:
-
         print("Ошибка публичной команды:", repr(e))
-
         public_answer = "Произошла ошибка. Попробуйте позже."
 
     if is_public:
 
         if public_answer:
-
             reply(peer_id, public_answer)
 
         return
 
     # ======================================================
     # ВСЕ ОСТАЛЬНЫЕ КОМАНДЫ — только ALLOWED_IDS
-    # Остальным бот молчит
     # ======================================================
 
     if from_id not in ALLOWED_IDS:
-
         return
 
     try:
-
         answer = handle(text, from_id)
-
     except Exception as e:
-
         print("Ошибка команды:", repr(e))
-
         answer = "Произошла ошибка при выполнении команды."
 
     if answer:
-
         reply(peer_id, answer)
+
+
+def safe_process(event):
+    try:
+        process_event(event)
+    except Exception as e:
+        print("Ошибка обработки:", repr(e))
 
 # ==========================================================
 # ЗАПУСК БОТА
@@ -641,34 +599,26 @@ def process_event(event):
 
 def main():
 
+    threading.Thread(target=keepalive_loop, daemon=True).start()
+
     while True:
 
         try:
-
             longpoll = VkBotLongPoll(vk_session, GROUP_ID)
 
             print("Бот запущен. Жду сообщения...")
 
             for event in longpoll.listen():
-
-                try:
-
-                    process_event(event)
-
-                except Exception as e:
-
-                    print("Ошибка обработки:", repr(e))
+                # каждое событие обрабатывается в своём потоке —
+                # медленная команда больше не блокирует остальные
+                executor.submit(safe_process, event)
 
         except vk_api.exceptions.ApiError as e:
-
             print("VK API:", repr(e))
-
             time.sleep(3)
 
         except Exception as e:
-
             print("Соединение прервано:", repr(e))
-
             time.sleep(2)
 
 # ==========================================================
@@ -676,5 +626,4 @@ def main():
 # ==========================================================
 
 if __name__ == "__main__":
-
     main()
