@@ -32,6 +32,9 @@ ALLOWED_IDS = {
     708897961
 }
 
+# Админы, прописанные в коде: командой их снять нельзя
+BASE_ADMIN_IDS = set(ALLOWED_IDS)
+
 # Файл, куда сохраняются админы, выданные командой /вд
 ADMINS_FILE = "admins.json"
 
@@ -321,6 +324,28 @@ def cmd_grant_admin(args):
 
     return f"[id{user_id}|Пользователь] теперь администратор."
 
+
+def cmd_revoke_admin(args):
+
+    if len(args) != 1:
+        return "Формат: /снятьвд @username"
+
+    user_id = resolve_user(args[0])
+
+    if user_id is None:
+        return f"Пользователь {args[0]} не найден в VK."
+
+    if user_id in BASE_ADMIN_IDS:
+        return "Этого админа нельзя снять командой, он прописан в коде."
+
+    if user_id not in ALLOWED_IDS:
+        return f"[id{user_id}|Пользователь] не администратор."
+
+    ALLOWED_IDS.discard(user_id)
+    save_admins()
+
+    return f"У [id{user_id}|пользователя] забран доступ админа."
+
 # ==========================================================
 # СПИСОК
 # ==========================================================
@@ -417,7 +442,8 @@ ADMIN_HELP = (
     "/список — список участников с баллами\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
     "/-магазин 3 — удалить товар из магазина по номеру\n"
-    "/вд @username — выдать полный доступ админа"
+    "/вд @username — выдать полный доступ админа\n"
+    "/снятьвд @username — забрать доступ админа"
 )
 
 
@@ -554,6 +580,9 @@ def handle(text, user_id):
 
     if command == "/вд":
         return cmd_grant_admin(args)
+
+    if command == "/снятьвд":
+        return cmd_revoke_admin(args)
 
     return None
 
