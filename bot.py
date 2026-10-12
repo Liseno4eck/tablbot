@@ -1,5 +1,6 @@
 import os
 import re
+import json
 import time
 import threading
 import requests
@@ -12,15 +13,16 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 # НАСТРОЙКИ
 # ==========================================================
 
-# ВСТАВЬ НОВЫЙ токен (старый засветился в чате — отзови его в настройках сообщества)
-VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a._74jNUH2XsupAUEs4x9E77nW5dOFjH4W8_fnoLzl9Aq5weI3PG6rOCiFIOJTq0HxxuTWwrsN13LsSDyiQYLB0r9oXg5ychaqmrySRp76k4_RGnQjo94fsIWw3lEOBhhDSo8p9ugMehGZMl4mGSEFgmjacafPAHLlQxSqz1PO6msQWXb7MWQIQjMbinOTB6duGmJCnykldQBot2b5_0xOJA").strip().strip('"').strip("'")
+# Токен лучше задавать переменной окружения VK_TOKEN (в Pterodactyl — в Startup/Variables).
+# Если хочешь вписать прямо сюда — замени ВСТАВЬ_ТОКЕН на новый токен сообщества.
+VK_TOKEN = os.environ.get("VK_TOKEN", "ВСТАВЬ_ТОКЕН").strip().strip('"').strip("'")
 
 GROUP_ID = 241841230
 
 SCRIPT_URL = "https://script.google.com/macros/s/AKfycbykzQWDnA468hYkYxXGqpfsdMSdugfekql11RNunw6vfw1Eu39uElFSaw3My8xza0Gw/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
-SCRIPT_SECRET = "724422"
+SCRIPT_SECRET = os.environ.get("SCRIPT_SECRET", "724422")
 
 # VK ID пользователей, которым доступны админские команды
 ALLOWED_IDS = {
@@ -29,6 +31,30 @@ ALLOWED_IDS = {
     200005206671,
     708897961
 }
+
+# Файл, куда сохраняются админы, выданные командой /вд
+ADMINS_FILE = "admins.json"
+
+
+def load_admins():
+    try:
+        with open(ADMINS_FILE, "r", encoding="utf-8") as f:
+            ALLOWED_IDS.update(int(x) for x in json.load(f))
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("Не удалось загрузить admins.json:", repr(e))
+
+
+def save_admins():
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(sorted(ALLOWED_IDS), f)
+    except Exception as e:
+        print("Не удалось сохранить admins.json:", repr(e))
+
+
+load_admins()
 
 DEBUG = False
 
@@ -274,6 +300,28 @@ def cmd_remove(args):
     })
 
 # ==========================================================
+# ВД — выдать полный доступ админа
+# ==========================================================
+
+def cmd_grant_admin(args):
+
+    if len(args) != 1:
+        return "Формат: /вд @username"
+
+    user_id = resolve_user(args[0])
+
+    if user_id is None:
+        return f"Пользователь {args[0]} не найден в VK."
+
+    if user_id in ALLOWED_IDS:
+        return f"[id{user_id}|Пользователь] уже администратор."
+
+    ALLOWED_IDS.add(user_id)
+    save_admins()
+
+    return f"[id{user_id}|Пользователь] теперь администратор."
+
+# ==========================================================
 # СПИСОК
 # ==========================================================
 
@@ -368,7 +416,8 @@ ADMIN_HELP = (
     "/убрать @username — удалить игрока из таблицы\n"
     "/список — список участников с баллами\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
-    "/-магазин 3 — удалить товар из магазина по номеру"
+    "/-магазин 3 — удалить товар из магазина по номеру\n"
+    "/вд @username — выдать полный доступ админа"
 )
 
 
@@ -502,6 +551,9 @@ def handle(text, user_id):
 
     if command == "/разослать":
         return cmd_broadcast(text)
+
+    if command == "/вд":
+        return cmd_grant_admin(args)
 
     return None
 
