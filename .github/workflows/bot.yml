@@ -1,0 +1,46 @@
+name: VK Bot
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: vk-bot
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Run bot
+        id: bot
+        env:
+          VK_TOKEN: ${{ secrets.VK_TOKEN }}
+        run: |
+          set +e
+          timeout 20400 python bot.py
+          code=$?
+          if [ $code -eq 124 ]; then
+            echo "restart=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit $code
+
+      - name: Restart for next cycle
+        if: steps.bot.outputs.restart == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run bot.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}"
