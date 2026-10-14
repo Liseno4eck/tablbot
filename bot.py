@@ -15,8 +15,10 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 
 # Токен лучше задавать переменной окружения VK_TOKEN (в Pterodactyl — в Startup/Variables).
 # Если хочешь вписать прямо сюда — замени ВСТАВЬ_ТОКЕН на новый токен сообщества.
-VK_TOKEN = os.environ.get("VK_TOKEN", "vk1.a._74jNUH2XsupAUEs4x9E77nW5dOFjH4W8_fnoLzl9Aq5weI3PG6rOCiFIOJTq0HxxuTWwrsN13LsSDyiQYLB0r9oXg5ychaqmrySRp76k4_RGnQjo94fsIWw3lEOBhhDSo8p9ugMehGZMl4mGSEFgmjacafPAHLlQxSqz1PO6msQWXb7MWQIQjMbinOTB6duGmJCnykldQBot2b5_0xOJA").strip().strip('"').strip("'")
-
+VK_TOKEN = os.environ["VK_TOKEN"]
+if not VK_TOKEN:
+    raise SystemExit("VK_TOKEN пустой: добавьте секрет VK_TOKEN в Settings → Secrets → Actions")
+    
 GROUP_ID = 241841230
 
 SCRIPT_URL = "https://script.google.com/macros/s/AKfycbykzQWDnA468hYkYxXGqpfsdMSdugfekql11RNunw6vfw1Eu39uElFSaw3My8xza0Gw/exec"
