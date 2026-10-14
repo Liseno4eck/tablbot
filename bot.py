@@ -14,14 +14,13 @@ from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 # ==========================================================
 
 # Токен лучше задавать переменной окружения VK_TOKEN (в Pterodactyl — в Startup/Variables).
-# Если хочешь вписать прямо сюда — замени ВСТАВЬ_ТОКЕН на новый токен сообщества.
-VK_TOKEN = os.environ["VK_TOKEN"]
+VK_TOKEN = os.environ.get("VK_TOKEN", "")
 if not VK_TOKEN:
-    raise SystemExit("VK_TOKEN пустой: добавьте секрет VK_TOKEN в Settings → Secrets → Actions")
-    
+    raise SystemExit("VK_TOKEN пустой: задайте переменную окружения VK_TOKEN")
+
 GROUP_ID = 241841230
 
-SCRIPT_URL = "https://script.google.com/macros/s/AKfycbykzQWDnA468hYkYxXGqpfsdMSdugfekql11RNunw6vfw1Eu39uElFSaw3My8xza0Gw/exec"
+SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz4TUC_LCx_HLDYB3vdYYb3isWywAEuLKBoHf-niZYD4c93Ob5agydUb0z25hIVSEzc/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
 SCRIPT_SECRET = os.environ.get("SCRIPT_SECRET", "724422")
@@ -286,6 +285,62 @@ def cmd_bind(args):
     })
 
 # ==========================================================
+# ИЗМЕНИТЬ
+#   /изменить Старый Новый                -> только ник
+#   /изменить Старый Новый по 25/09       -> ник + должность + дата
+#   /изменить Ник по 25/09                -> только должность + дата
+# ==========================================================
+
+CHANGE_FORMAT = (
+    "Формат:\n"
+    "/изменить Старый_Ник Новый_Ник — сменить ник\n"
+    "/изменить Старый_Ник Новый_Ник по 25/09 — сменить ник, должность и дату\n"
+    "/изменить Ник по 25/09 — сменить только должность и дату"
+)
+
+
+def cmd_change(args):
+
+    # /изменить Старый Новый
+    if len(args) == 2:
+        return call_sheet({
+            "action": "change",
+            "nick": args[0],
+            "new_nick": args[1]
+        })
+
+    # /изменить Ник по 25/09
+    # /изменить Старый Новый по 25/09
+    if len(args) in (3, 4):
+
+        if len(args) == 3:
+            nick, new_nick, position, date = args[0], None, args[1], args[2]
+        else:
+            nick, new_nick, position, date = args[0], args[1], args[2], args[3]
+
+        position = position.lower()
+
+        if position not in ("по", "зо"):
+            return "Должность должна быть «по» или «зо»."
+
+        if not re.fullmatch(r"\d{2}/\d{2}", date):
+            return "Дата должна быть в формате дд/мм."
+
+        payload = {
+            "action": "change",
+            "nick": nick,
+            "position": position,
+            "date": date
+        }
+
+        if new_nick:
+            payload["new_nick"] = new_nick
+
+        return call_sheet(payload)
+
+    return CHANGE_FORMAT
+
+# ==========================================================
 # УБРАТЬ
 # ==========================================================
 
@@ -440,6 +495,9 @@ ADMIN_HELP = (
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
     "/привязать @username Nick_Name по 25/09 — привязать игрока\n"
+    "/изменить Старый Новый — сменить ник\n"
+    "/изменить Старый Новый по 25/09 — сменить ник, должность и дату\n"
+    "/изменить Ник по 25/09 — сменить только должность и дату\n"
     "/убрать @username — удалить игрока из таблицы\n"
     "/список — список участников с баллами\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
@@ -564,6 +622,9 @@ def handle(text, user_id):
 
     if command == "/привязать":
         return cmd_bind(args)
+
+    if command == "/изменить":
+        return cmd_change(args)
 
     if command == "/убрать":
         return cmd_remove(args)
