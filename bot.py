@@ -20,7 +20,7 @@ if not VK_TOKEN:
 
 GROUP_ID = 241841230
 
-SCRIPT_URL = "https://script.google.com/macros/s/AKfycbz4TUC_LCx_HLDYB3vdYYb3isWywAEuLKBoHf-niZYD4c93Ob5agydUb0z25hIVSEzc/exec"
+SCRIPT_URL = "https://script.google.com/macros/s/AKfycbxuPmZE0ApEB3rq_6Nj1ZXiuWFkdo7TVpdnPAbHglEFkNkeUPsyFU0g22aIi3SaCNMt/exec"
 
 # Должен совпадать с SECRET в Google Apps Script
 SCRIPT_SECRET = os.environ.get("SCRIPT_SECRET", "724422")
@@ -36,29 +36,9 @@ ALLOWED_IDS = {
 # Админы, прописанные в коде: командой их снять нельзя
 BASE_ADMIN_IDS = set(ALLOWED_IDS)
 
-# Файл, куда сохраняются админы, выданные командой /вд
+# Локальный файл — только запасной вариант на случай, если таблица недоступна при старте.
+# Основное хранилище админов — Google Apps Script (переживает перезапуски и передеплой).
 ADMINS_FILE = "admins.json"
-
-
-def load_admins():
-    try:
-        with open(ADMINS_FILE, "r", encoding="utf-8") as f:
-            ALLOWED_IDS.update(int(x) for x in json.load(f))
-    except FileNotFoundError:
-        pass
-    except Exception as e:
-        print("Не удалось загрузить admins.json:", repr(e))
-
-
-def save_admins():
-    try:
-        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
-            json.dump(sorted(ALLOWED_IDS), f)
-    except Exception as e:
-        print("Не удалось сохранить admins.json:", repr(e))
-
-
-load_admins()
 
 DEBUG = False
 
@@ -67,7 +47,7 @@ SHEET_TIMEOUT = 25
 KEEPALIVE_INTERVAL = 240
 
 # Действия, которые только читают (их безопасно повторять при таймауте)
-READ_ACTIONS = {"list", "my_points", "all_links", "shop_list", "ping"}
+READ_ACTIONS = {"list", "my_points", "all_links", "shop_list", "ping", "admins_get"}
 
 # ==========================================================
 # ПОДКЛЮЧЕНИЕ К VK
@@ -100,7 +80,7 @@ def reply(peer_id, text):
 
 
 def notify_admins(text):
-    for admin_id in ALLOWED_IDS:
+    for admin_id in list(ALLOWED_IDS):
         try:
             vk.messages.send(user_id=admin_id, message=text, random_id=0)
         except Exception as e:
@@ -187,6 +167,72 @@ def call_sheet_ex(payload):
 
 def call_sheet(payload):
     return call_sheet_ex(payload)[0]
+
+# ==========================================================
+# ХРАНЕНИЕ АДМИНОВ (Google Apps Script + локальный файл как запас)
+# ==========================================================
+
+def _apply_admins(extra_ids):
+    """Обновляет ALLOWED_IDS на месте: админы из кода + extra_ids."""
+    new_ids = set(BASE_ADMIN_IDS) | set(extra_ids)
+    ALLOWED_IDS.difference_update(ALLOWED_IDS - new_ids)
+    ALLOWED_IDS.update(new_ids)
+
+
+def load_admins(use_file_fallback=False):
+    """
+    Загружает админов из таблицы. Возвращает True, если удалось.
+    Если таблица недоступна и use_file_fallback=True — берёт локальный файл.
+    """
+
+    try:
+        text, data = call_sheet_ex({"action": "admins_get"})
+
+        if data is not None and isinstance(data.get("admins"), list):
+            _apply_admins(int(x) for x in data["admins"])
+            return True
+
+        print("Не удалось получить админов из таблицы:", text)
+
+    except Exception as e:
+        print("Ошибка загрузки админов из таблицы:", repr(e))
+
+    if use_file_fallback:
+        try:
+            with open(ADMINS_FILE, "r", encoding="utf-8") as f:
+                _apply_admins(int(x) for x in json.load(f))
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            print("Не удалось загрузить admins.json:", repr(e))
+
+    return False
+
+
+def save_admins():
+    """Сохраняет админов в таблицу (и в локальный файл как запас). True — если в таблицу записалось."""
+
+    ids = sorted(ALLOWED_IDS)
+    saved = False
+
+    try:
+        text, data = call_sheet_ex({"action": "admins_set", "admins": ids})
+
+        if data is not None:
+            saved = True
+        else:
+            print("Не удалось сохранить админов в таблицу:", text)
+
+    except Exception as e:
+        print("Ошибка сохранения админов в таблицу:", repr(e))
+
+    try:
+        with open(ADMINS_FILE, "w", encoding="utf-8") as f:
+            json.dump(ids, f)
+    except Exception as e:
+        print("Не удалось сохранить admins.json:", repr(e))
+
+    return saved
 
 # ==========================================================
 # ПРОГРЕВ APPS SCRIPT (чтобы не "засыпал")
@@ -363,6 +409,17 @@ def cmd_remove(args):
 # ВД — выдать полный доступ админа
 # ==========================================================
 
+ADMINS_UNAVAILABLE = (
+    "Не удалось связаться с таблицей, список админов не изменён. "
+    "Попробуйте ещё раз."
+)
+
+ADMINS_SAVE_FAILED = (
+    "Не удалось сохранить список админов в таблицу. "
+    "Изменение действует только до перезапуска бота. Попробуйте ещё раз."
+)
+
+
 def cmd_grant_admin(args):
 
     if len(args) != 1:
@@ -373,11 +430,17 @@ def cmd_grant_admin(args):
     if user_id is None:
         return f"Пользователь {args[0]} не найден в VK."
 
+    # подтягиваем актуальный список, чтобы не затереть чужие изменения
+    if not load_admins():
+        return ADMINS_UNAVAILABLE
+
     if user_id in ALLOWED_IDS:
         return f"[id{user_id}|Пользователь] уже администратор."
 
     ALLOWED_IDS.add(user_id)
-    save_admins()
+
+    if not save_admins():
+        return ADMINS_SAVE_FAILED
 
     return f"[id{user_id}|Пользователь] теперь администратор."
 
@@ -395,11 +458,16 @@ def cmd_revoke_admin(args):
     if user_id in BASE_ADMIN_IDS:
         return "Этого админа нельзя снять командой, он прописан в коде."
 
+    if not load_admins():
+        return ADMINS_UNAVAILABLE
+
     if user_id not in ALLOWED_IDS:
         return f"[id{user_id}|Пользователь] не администратор."
 
     ALLOWED_IDS.discard(user_id)
-    save_admins()
+
+    if not save_admins():
+        return ADMINS_SAVE_FAILED
 
     return f"У [id{user_id}|пользователя] забран доступ админа."
 
@@ -743,6 +811,12 @@ def safe_process(event):
 # ==========================================================
 
 def main():
+
+    # подтягиваем админов, выданных через /вд (из таблицы; файл — только запас)
+    if load_admins(use_file_fallback=True):
+        print(f"Админы загружены из таблицы. Всего админов: {len(ALLOWED_IDS)}")
+    else:
+        print(f"Таблица недоступна, админы взяты из запасного файла. Всего: {len(ALLOWED_IDS)}")
 
     threading.Thread(target=keepalive_loop, daemon=True).start()
 
