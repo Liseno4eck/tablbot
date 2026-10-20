@@ -35,9 +35,18 @@ BASE_ADMIN_IDS = set(ALLOWED_IDS)
 # Локальный файл (запасной вариант)
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
+# ----------------------------------------------------------
 # Постоянное хранилище: приватный GitHub Gist
-GIST_TOKEN = os.environ.get("GIST_TOKEN", "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").strip()
-GIST_ID = os.environ.get("GIST_ID", "3584861fe5743a5ed11607446f06b992").strip()
+#
+# Обычно значения берутся из переменных окружения GIST_TOKEN и GIST_ID.
+# Если хостинг не передаёт переменные, впишите значения сюда в кавычках
+# (но тогда НЕ выкладывайте код в публичный репозиторий!).
+# ----------------------------------------------------------
+GIST_TOKEN_FALLBACK = "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"
+GIST_ID_FALLBACK = "3584861fe5743a5ed11607446f06b992"
+
+GIST_TOKEN = (os.environ.get("GIST_TOKEN", "") or GIST_TOKEN_FALLBACK).strip()
+GIST_ID = (os.environ.get("GIST_ID", "") or GIST_ID_FALLBACK).strip()
 GIST_FILENAME = "data.json"
 GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 
@@ -74,6 +83,16 @@ _gist_lock = threading.Lock()
 _gist_event = threading.Event()
 
 
+def _http_error_text(e):
+    """Достаёт текст ответа GitHub из ошибки, если он есть."""
+    try:
+        if hasattr(e, "read"):
+            return e.read().decode("utf-8", "ignore")
+    except Exception:
+        pass
+    return ""
+
+
 def _gist_request(method, url, body=None):
     headers = {
         "Authorization": f"Bearer {GIST_TOKEN}",
@@ -101,7 +120,8 @@ def gist_load():
         file_info = info.get("files", {}).get(GIST_FILENAME)
 
         if file_info is None:
-            print(f"В гисте нет файла {GIST_FILENAME}")
+            print(f"В гисте нет файла {GIST_FILENAME}. "
+                  f"Есть файлы: {list(info.get('files', {}).keys())}")
             return None
 
         content = file_info.get("content")
@@ -123,7 +143,7 @@ def gist_load():
         return json.loads(content)
 
     except Exception as e:
-        print("Не удалось загрузить данные из Gist:", repr(e))
+        print("Не удалось загрузить данные из Gist:", repr(e), _http_error_text(e))
         return None
 
 
@@ -154,11 +174,11 @@ def _gist_worker():
         while True:
             try:
                 _gist_push(payload)
-                if DEBUG:
-                    print("Данные отправлены в Gist")
+                print("Данные отправлены в Gist")
                 break
             except Exception as e:
-                print("Ошибка отправки в Gist, повтор через 10 сек:", repr(e))
+                print("Ошибка отправки в Gist, повтор через 10 сек:",
+                      repr(e), _http_error_text(e))
                 time.sleep(10)
 
                 # если за это время появилась более свежая версия — шлём её
@@ -837,6 +857,12 @@ def safe_process(event):
 
 def main():
 
+    print(
+        "GIST_ENABLED:", GIST_ENABLED,
+        "| GIST_ID:", (GIST_ID[:6] + "...") if GIST_ID else "(пусто)",
+        "| длина токена:", len(GIST_TOKEN)
+    )
+
     if GIST_ENABLED:
         threading.Thread(target=_gist_worker, daemon=True).start()
         print("Постоянное хранилище: GitHub Gist включено.")
@@ -847,6 +873,17 @@ def main():
         )
 
     load_data()
+
+    # Тестовая запись, чтобы сразу увидеть ошибку, если она есть
+    if GIST_ENABLED:
+        try:
+            with lock:
+                payload = json.dumps(data, ensure_ascii=False, indent=2)
+            _gist_push(payload)
+            print("ТЕСТ Gist: запись прошла успешно")
+        except Exception as e:
+            print("ТЕСТ Gist: ОШИБКА:", repr(e))
+            print(_http_error_text(e))
 
     print(
         f"Игроков: {len(data['players'])}, "
