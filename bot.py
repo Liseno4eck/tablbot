@@ -36,8 +36,8 @@ BASE_ADMIN_IDS = set(ALLOWED_IDS)
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 
 # Постоянное хранилище: приватный GitHub Gist
-GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
-GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "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").strip()
+GIST_ID = os.environ.get("GIST_ID", "3584861fe5743a5ed11607446f06b992").strip()
 GIST_FILENAME = "data.json"
 GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 
