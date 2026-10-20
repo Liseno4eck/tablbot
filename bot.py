@@ -3,6 +3,8 @@ import re
 import json
 import time
 import threading
+import urllib.request
+import urllib.error
 import vk_api
 
 from concurrent.futures import ThreadPoolExecutor
@@ -13,7 +15,6 @@ from vk_api.utils import get_random_id
 # НАСТРОЙКИ
 # ==========================================================
 
-# Токен лучше задавать переменной окружения VK_TOKEN (в Pterodactyl — в Startup/Variables).
 VK_TOKEN = os.environ.get("VK_TOKEN", "")
 if not VK_TOKEN:
     raise SystemExit("VK_TOKEN пустой: задайте переменную окружения VK_TOKEN")
@@ -31,9 +32,14 @@ ALLOWED_IDS = {
 # Админы, прописанные в коде: командой их снять нельзя
 BASE_ADMIN_IDS = set(ALLOWED_IDS)
 
-# Единственное хранилище: локальный JSON-файл рядом с ботом.
-# На Pterodactyl он переживает перезапуски. Не удаляйте data.json при передеплое!
+# Локальный файл (запасной вариант)
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
+
+# Постоянное хранилище: приватный GitHub Gist
+GIST_TOKEN = os.environ.get("GIST_TOKEN", "").strip()
+GIST_ID = os.environ.get("GIST_ID", "").strip()
+GIST_FILENAME = "data.json"
+GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 
 DEBUG = False
 
@@ -47,7 +53,7 @@ vk = vk_session.get_api()
 executor = ThreadPoolExecutor(max_workers=8)
 
 # ==========================================================
-# ХРАНИЛИЩЕ (data.json)
+# ХРАНИЛИЩЕ
 #
 # {
 #   "players": {"nick_lower": {"nick": "Nick_Name", "vk_id": 123, "points": 0}},
@@ -59,38 +65,185 @@ executor = ThreadPoolExecutor(max_workers=8)
 lock = threading.RLock()
 data = {"players": {}, "shop": [], "admins": []}
 
+# ----------------------------------------------------------
+# GitHub Gist
+# ----------------------------------------------------------
+
+_gist_payload = None            # последняя версия, которую надо отправить
+_gist_lock = threading.Lock()
+_gist_event = threading.Event()
+
+
+def _gist_request(method, url, body=None):
+    headers = {
+        "Authorization": f"Bearer {GIST_TOKEN}",
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "vk-points-bot",
+    }
+    raw = None
+    if body is not None:
+        raw = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+
+    req = urllib.request.Request(url, data=raw, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8")
+
+
+def gist_load():
+    """Возвращает dict из гиста или None, если не удалось получить."""
+    if not GIST_ENABLED:
+        return None
+
+    try:
+        text = _gist_request("GET", f"https://api.github.com/gists/{GIST_ID}")
+        info = json.loads(text)
+        file_info = info.get("files", {}).get(GIST_FILENAME)
+
+        if file_info is None:
+            print(f"В гисте нет файла {GIST_FILENAME}")
+            return None
+
+        content = file_info.get("content")
+
+        if file_info.get("truncated") and file_info.get("raw_url"):
+            req = urllib.request.Request(
+                file_info["raw_url"],
+                headers={"Authorization": f"Bearer {GIST_TOKEN}",
+                         "User-Agent": "vk-points-bot"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content = resp.read().decode("utf-8")
+
+        content = (content or "").strip()
+
+        if not content:
+            return {}
+
+        return json.loads(content)
+
+    except Exception as e:
+        print("Не удалось загрузить данные из Gist:", repr(e))
+        return None
+
+
+def _gist_push(payload):
+    _gist_request(
+        "PATCH",
+        f"https://api.github.com/gists/{GIST_ID}",
+        {"files": {GIST_FILENAME: {"content": payload}}},
+    )
+
+
+def _gist_worker():
+    global _gist_payload
+
+    while True:
+        _gist_event.wait()
+        _gist_event.clear()
+
+        # небольшая пауза: если изменений пришло много, отправим одним запросом
+        time.sleep(1)
+
+        with _gist_lock:
+            payload = _gist_payload
+
+        if payload is None:
+            continue
+
+        while True:
+            try:
+                _gist_push(payload)
+                if DEBUG:
+                    print("Данные отправлены в Gist")
+                break
+            except Exception as e:
+                print("Ошибка отправки в Gist, повтор через 10 сек:", repr(e))
+                time.sleep(10)
+
+                # если за это время появилась более свежая версия — шлём её
+                with _gist_lock:
+                    payload = _gist_payload
+
+
+def gist_schedule(payload):
+    global _gist_payload
+
+    if not GIST_ENABLED:
+        return
+
+    with _gist_lock:
+        _gist_payload = payload
+
+    _gist_event.set()
+
+
+# ----------------------------------------------------------
+# Сохранение / загрузка
+# ----------------------------------------------------------
 
 def save_data():
-    """Атомарная запись: сначала во временный файл, потом подмена."""
+    """Локальная атомарная запись + копия в Gist."""
+    with lock:
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+
     tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(payload)
+        os.replace(tmp, DATA_FILE)
+    except Exception as e:
+        print("Ошибка записи локального файла:", repr(e))
+
+    gist_schedule(payload)
 
 
-def load_data():
+def _has_content(d):
+    return bool(d) and bool(d.get("players") or d.get("shop") or d.get("admins"))
+
+
+def _read_local():
     if not os.path.exists(DATA_FILE):
-        save_data()
-        return
+        return None
 
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
-            loaded = json.load(f)
+            return json.load(f)
     except Exception as e:
-        # не затираем битый файл — делаем копию и стартуем с пустого
-        print("Не удалось прочитать data.json:", repr(e))
+        print("Не удалось прочитать локальный data.json:", repr(e))
         try:
             os.replace(DATA_FILE, DATA_FILE + ".broken")
         except Exception:
             pass
-        save_data()
-        return
+        return None
+
+
+def load_data():
+    local = _read_local()
+    remote = gist_load() if GIST_ENABLED else None
+
+    if GIST_ENABLED and remote is None:
+        print("ВНИМАНИЕ: Gist недоступен, использую локальный файл.")
+
+    # Приоритет: Gist (если в нём есть данные), иначе локальный файл
+    if remote is not None and _has_content(remote):
+        loaded = remote
+        print("Данные загружены из GitHub Gist.")
+    elif local is not None:
+        loaded = local
+        print("Данные загружены из локального файла.")
+    else:
+        loaded = {}
+        print("Данных нет, старт с пустого хранилища.")
 
     data["players"] = loaded.get("players", {})
     data["shop"] = loaded.get("shop", [])
     data["admins"] = loaded.get("admins", [])
 
     ALLOWED_IDS.update(int(x) for x in data["admins"])
+
+    # Синхронизируем: если Gist пустой/недоступен, а данные есть — зальём в него
+    save_data()
 
 
 def find_by_nick(nick):
@@ -684,10 +837,19 @@ def safe_process(event):
 
 def main():
 
+    if GIST_ENABLED:
+        threading.Thread(target=_gist_worker, daemon=True).start()
+        print("Постоянное хранилище: GitHub Gist включено.")
+    else:
+        print(
+            "ВНИМАНИЕ: GIST_TOKEN/GIST_ID не заданы — данные хранятся только "
+            "локально и могут пропасть при передеплое!"
+        )
+
     load_data()
 
     print(
-        f"Данные загружены. Игроков: {len(data['players'])}, "
+        f"Игроков: {len(data['players'])}, "
         f"товаров: {len(data['shop'])}, админов: {len(ALLOWED_IDS)}"
     )
 
