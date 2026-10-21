@@ -435,7 +435,7 @@ def cmd_revoke_admin(args):
         save_data()
         return "У [id" + str(user_id) + "|пользователя] забран доступ админа."
 # ==========================================================
-# СПИСОК — показывает баллы, отгулы и отпуск
+# СПИСОК — баллы (или отпуск/отгул) и ссылка на ВК
 # ==========================================================
 def cmd_list(args):
     if args:
@@ -451,12 +451,14 @@ def cmd_list(args):
         for i, p in enumerate(players, 1):
             vacation = p.get("vacation")
             otgul = p.get("otgul", 0)
-            line = str(i) + ". " + p["nick"] + " — " + str(p["points"])
+            link = "(vk.com/id" + str(p["vk_id"]) + ")"
             if vacation:
-                line = str(i) + ". " + p["nick"] + " — отпуск до " + vacation
+                status = "отпуск до " + vacation
             elif otgul:
-                line = str(i) + ". " + p["nick"] + " — отгул"
-            lines.append(line)
+                status = "отгул"
+            else:
+                status = str(p["points"])
+            lines.append(str(i) + ". " + p["nick"] + " — " + status + " " + link)
         return "Участники:\n" + "\n".join(lines)
 # ==========================================================
 # РАЗОСЛАТЬ
@@ -517,32 +519,30 @@ def cmd_buy(args, user_id):
         if player["points"] < item["price"]:
             return "Не хватает баллов. Нужно " + str(item["price"]) + ", у вас " + str(player["points"]) + "."
         item_name = item["name"]
-        name_lower = item_name.lower().strip()
-        # === ОТГУЛ ===
-        if name_lower == "отгул":
-            player["points"] -= item["price"]
-            player["otgul"] = player.get("otgul", 0) + 1
-            left = player["points"]
-            save_data()
-            return "Вы купили отгул! Осталось баллов: " + str(left) + "."
-        # === ОТПУСК ===
-        if name_lower == "отпуск":
-            player["points"] -= item["price"]
-            player["waiting_vacation"] = True
-            save_data()
-            return "Ваш отпуск оплачен! Напишите дату окончания в формате ДД.ММ (например 15.12):"
-        # === ОБЫЧНЫЙ ТОВАР ===
-        player["points"] -= item["price"]
-        nick = player["nick"]
-        left = player["points"]
         item_price = item["price"]
+        name_lower = item_name.lower().strip()
+        nick = player["nick"]
+
+        player["points"] -= item_price
+        left = player["points"]
+
+        if name_lower == "отгул":
+            player["otgul"] = player.get("otgul", 0) + 1
+            answer = "Вы купили отгул! Осталось баллов: " + str(left) + "."
+        elif name_lower == "отпуск":
+            player["waiting_vacation"] = True
+            answer = "Ваш отпуск оплачен! Напишите дату окончания в формате ДД.ММ (например 15.12):"
+        else:
+            answer = "Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
+
         save_data()
+        # Уведомление админам при ЛЮБОЙ покупке (включая отгул и отпуск)
         executor.submit(
             notify_admins,
             "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
             + item_name + " (" + str(item_price) + " баллов). Выдайте ему.",
         )
-        return "Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
+        return answer
 def cmd_shop_add(args):
     if len(args) < 2 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /+магазин 100 что выдать"
