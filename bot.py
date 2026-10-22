@@ -16,13 +16,15 @@ VK_TOKEN = os.environ.get("VK_TOKEN", "").strip()
 if not VK_TOKEN:
     raise SystemExit("VK_TOKEN пустой: задайте переменную окружения VK_TOKEN")
 GROUP_ID = 241841230
+# Общие админы: имеют доступ ко ВСЕМ спискам (/список и /нлист)
 ALLOWED_IDS = {
     875762552,
     857698829,
-    200005206671,
-    708897961,
+    708897961
 }
 BASE_ADMIN_IDS = set(ALLOWED_IDS)
+# Админы второго списка (/нлист): выдаются командой /вдв
+NADMIN_IDS = set()
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 GIST_TOKEN_FALLBACK = ""
 GIST_ID_FALLBACK = ""
@@ -46,11 +48,21 @@ vk = vk_session.get_api()
 executor = ThreadPoolExecutor(max_workers=8)
 # ==========================================================
 # ХРАНИЛИЩЕ
-# players: nick_lower -> {nick, vk_id, points, vacation, waiting_vacation}
+# Список 1 (/список):  players, shop, admins
+# Список 2 (/нлист):   nplayers, nshop, nadmins
+# players: nick_lower -> {nick, vk_id, points, vacation, otgul, waiting_vacation}
 # ==========================================================
 lock = threading.RLock()
 save_lock = threading.Lock()
-data = {"players": {}, "shop": [], "admins": []}
+data = {
+    "players": {}, "shop": [], "admins": [],
+    "nplayers": {}, "nshop": [], "nadmins": [],
+}
+LIST_TITLE = {1: "/список", 2: "/нлист"}
+def P(n):
+    return data["players"] if n == 1 else data["nplayers"]
+def S(n):
+    return data["shop"] if n == 1 else data["nshop"]
 def _http_error_text(e):
     try:
         if hasattr(e, "read"):
@@ -137,7 +149,7 @@ def _save_local(payload):
             f.write(payload)
             f.flush()
             os.fsync(f.fileno())
-            os.replace(tmp, DATA_FILE)
+        os.replace(tmp, DATA_FILE)
         return True
     except Exception as e:
         print("Ошибка записи локального файла:", repr(e))
@@ -155,8 +167,9 @@ def save_data():
             if GIST_ENABLED:
                 return gist_save(payload)
             return True
+DATA_KEYS = ("players", "shop", "admins", "nplayers", "nshop", "nadmins")
 def _has_content(d):
-    return bool(d) and any(d.get(key) for key in ("players", "shop", "admins"))
+    return bool(d) and any(d.get(key) for key in DATA_KEYS)
 def _read_local():
     if not os.path.exists(DATA_FILE):
         return None
@@ -173,9 +186,8 @@ def _read_local():
         except Exception:
             pass
         return None
-def _normalize_loaded(loaded):
+def _norm_players(raw_players):
     players = {}
-    raw_players = loaded.get("players")
     if isinstance(raw_players, dict):
         for key, value in raw_players.items():
             if not isinstance(value, dict):
@@ -189,6 +201,10 @@ def _normalize_loaded(loaded):
                 points = int(value.get("points", 0))
             except (TypeError, ValueError):
                 points = 0
+            try:
+                otgul = int(value.get("otgul", 0) or 0)
+            except (TypeError, ValueError):
+                otgul = 0
             if not nick or vk_id <= 0:
                 continue
             players[nick.lower()] = {
@@ -196,11 +212,12 @@ def _normalize_loaded(loaded):
                 "vk_id": vk_id,
                 "points": points,
                 "vacation": value.get("vacation"),
-                "otgul": int(value.get("otgul", 0) or 0),
+                "otgul": otgul,
                 "waiting_vacation": bool(value.get("waiting_vacation", False)),
             }
+    return players
+def _norm_shop(raw_shop):
     shop = []
-    raw_shop = loaded.get("shop")
     if isinstance(raw_shop, list):
         for item in raw_shop:
             if not isinstance(item, dict):
@@ -212,15 +229,25 @@ def _normalize_loaded(loaded):
                 continue
             if name and price > 0:
                 shop.append({"name": name, "price": price})
-    admins = []
-    raw_admins = loaded.get("admins")
-    if isinstance(raw_admins, list):
-        for value in raw_admins:
+    return shop
+def _norm_ids(raw_ids):
+    ids = []
+    if isinstance(raw_ids, list):
+        for value in raw_ids:
             try:
-                admins.append(int(value))
+                ids.append(int(value))
             except (TypeError, ValueError):
                 pass
-    return {"players": players, "shop": shop, "admins": admins}
+    return ids
+def _normalize_loaded(loaded):
+    return {
+        "players": _norm_players(loaded.get("players")),
+        "shop": _norm_shop(loaded.get("shop")),
+        "admins": _norm_ids(loaded.get("admins")),
+        "nplayers": _norm_players(loaded.get("nplayers")),
+        "nshop": _norm_shop(loaded.get("nshop")),
+        "nadmins": _norm_ids(loaded.get("nadmins")),
+    }
 def load_data():
     local = _read_local()
     remote = gist_load_with_retry() if GIST_ENABLED else None
@@ -252,12 +279,13 @@ def load_data():
             print("Данных нет, старт с пустого хранилища.")
             print("ВНИМАНИЕ: GIST_TOKEN/GIST_ID не заданы — данные хранятся только локально!")
     normalized = _normalize_loaded(loaded)
-    data["players"] = normalized["players"]
-    data["shop"] = normalized["shop"]
-    data["admins"] = normalized["admins"]
+    for key in DATA_KEYS:
+        data[key] = normalized[key]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
+    NADMIN_IDS.clear()
+    NADMIN_IDS.update(data["nadmins"])
     if need_push:
         if not save_data():
             raise SystemExit("Не удалось записать начальные данные в Gist. Бот остановлен.")
@@ -265,10 +293,10 @@ def load_data():
         with lock:
             payload = json.dumps(data, ensure_ascii=False, indent=2)
             _save_local(payload)
-def find_by_nick(nick):
-    return data["players"].get(nick.lower())
-def find_by_id(vk_id):
-    for p in data["players"].values():
+def find_by_nick(n, nick):
+    return P(n).get(nick.lower())
+def find_by_id(n, vk_id):
+    for p in P(n).values():
         if p["vk_id"] == vk_id:
             return p
     return None
@@ -281,7 +309,19 @@ def reply(peer_id, text):
     except Exception as e:
         print("Ошибка отправки сообщения:", repr(e))
 def notify_admins(text):
+    """Уведомление общим админам (покупки из списка 1)."""
     for admin_id in list(ALLOWED_IDS):
+        try:
+            vk.messages.send(user_id=admin_id, message=text, random_id=get_random_id())
+        except Exception as e:
+            print("Не удалось написать " + str(admin_id) + ":", repr(e))
+def notify_nadmins(text):
+    """Уведомление ТОЛЬКО тем, кто получил доступ через /вдв (покупки из /нлист)."""
+    ids = list(NADMIN_IDS)
+    if not ids:
+        print("Покупка в /нлист, но нет ни одного админа с /вдв: " + text)
+        return
+    for admin_id in ids:
         try:
             vk.messages.send(user_id=admin_id, message=text, random_id=get_random_id())
         except Exception as e:
@@ -312,7 +352,7 @@ def resolve_user(raw):
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
-def cmd_give(args, sign):
+def cmd_give(args, sign, n):
     if len(args) != 2 or not re.fullmatch(r"\d+", args[1]):
         command = "/выдать" if sign > 0 else "/забрать"
         return "Формат: " + command + " Nick_Name 5"
@@ -320,9 +360,9 @@ def cmd_give(args, sign):
     if amount <= 0:
         return "Количество баллов должно быть больше 0."
     with lock:
-        player = find_by_nick(args[0])
+        player = find_by_nick(n, args[0])
         if player is None:
-            return "Игрок " + args[0] + " не найден."
+            return "Игрок " + args[0] + " не найден (" + LIST_TITLE[n] + ")."
         if sign < 0 and player["points"] < amount:
             return "У " + player["nick"] + " только " + str(player["points"]) + " баллов, забрать " + str(amount) + " нельзя."
         player["points"] += sign * amount
@@ -334,7 +374,7 @@ def cmd_give(args, sign):
 # ==========================================================
 # ПРИВЯЗАТЬ
 # ==========================================================
-def cmd_bind(args):
+def cmd_bind(args, n):
     if len(args) != 2:
         return "Формат: /привязать @username Nick_Name"
     username, nick = args
@@ -342,12 +382,12 @@ def cmd_bind(args):
     if user_id is None:
         return "Пользователь " + username + " не найден в VK."
     with lock:
-        if find_by_nick(nick) is not None:
-            return "Ник " + nick + " уже занят."
-        existing = find_by_id(user_id)
+        if find_by_nick(n, nick) is not None:
+            return "Ник " + nick + " уже занят (" + LIST_TITLE[n] + ")."
+        existing = find_by_id(n, user_id)
         if existing is not None:
-            return "Этот пользователь уже привязан к нику " + existing["nick"] + "."
-        data["players"][nick.lower()] = {
+            return "Этот пользователь уже привязан к нику " + existing["nick"] + " (" + LIST_TITLE[n] + ")."
+        P(n)[nick.lower()] = {
             "nick": nick,
             "vk_id": user_id,
             "points": 0,
@@ -356,53 +396,53 @@ def cmd_bind(args):
             "waiting_vacation": False,
         }
         save_data()
-        return "Игрок " + nick + " привязан к https://vk.com/id" + str(user_id) + "."
+        return "Игрок " + nick + " привязан к https://vk.com/id" + str(user_id) + " (" + LIST_TITLE[n] + ")."
 # ==========================================================
 # ОТВЯЗАТЬ
 # ==========================================================
-def cmd_unbind(args):
+def cmd_unbind(args, n):
     if len(args) != 1:
         return "Формат: /отвязать @username или /отвязать Nick_Name"
     target = args[0]
     with lock:
-        player = find_by_nick(target)
+        player = find_by_nick(n, target)
         if player is not None:
             nick = player["nick"]
-            del data["players"][nick.lower()]
+            del P(n)[nick.lower()]
             save_data()
-            return "Игрок " + nick + " отвязан."
-        user_id = resolve_user(target)
-        if user_id is None:
-            return "Игрок " + target + " не найден."
-        with lock:
-            player = find_by_id(user_id)
-            if player is None:
-                return "Игрок " + target + " не найден."
-            nick = player["nick"]
-            del data["players"][nick.lower()]
-            save_data()
-            return "Игрок " + nick + " отвязан."
+            return "Игрок " + nick + " отвязан (" + LIST_TITLE[n] + ")."
+    user_id = resolve_user(target)
+    if user_id is None:
+        return "Игрок " + target + " не найден."
+    with lock:
+        player = find_by_id(n, user_id)
+        if player is None:
+            return "Игрок " + target + " не найден (" + LIST_TITLE[n] + ")."
+        nick = player["nick"]
+        del P(n)[nick.lower()]
+        save_data()
+        return "Игрок " + nick + " отвязан (" + LIST_TITLE[n] + ")."
 # ==========================================================
 # ИЗМЕНИТЬ (смена ника)
 # ==========================================================
-def cmd_change(args):
+def cmd_change(args, n):
     if len(args) != 2:
         return "Формат: /изменить Старый_Ник Новый_Ник"
     old, new = args
     with lock:
-        player = find_by_nick(old)
+        player = find_by_nick(n, old)
         if player is None:
-            return "Игрок " + old + " не найден."
-        if old.lower() != new.lower() and find_by_nick(new) is not None:
+            return "Игрок " + old + " не найден (" + LIST_TITLE[n] + ")."
+        if old.lower() != new.lower() and find_by_nick(n, new) is not None:
             return "Ник " + new + " уже занят."
         old_nick = player["nick"]
-        del data["players"][old_nick.lower()]
+        del P(n)[old_nick.lower()]
         player["nick"] = new
-        data["players"][new.lower()] = player
+        P(n)[new.lower()] = player
         save_data()
         return "Ник изменён: " + old_nick + " -> " + new + "."
 # ==========================================================
-# ВД — выдать полный доступ админа
+# ВД — полный доступ общего админа
 # ==========================================================
 def cmd_grant_admin(args):
     if len(args) != 1:
@@ -435,14 +475,45 @@ def cmd_revoke_admin(args):
         save_data()
         return "У [id" + str(user_id) + "|пользователя] забран доступ админа."
 # ==========================================================
-# СПИСОК — баллы (или отпуск/отгул) и ссылка на ВК
+# ВДВ — доступ к боту только для списка /нлист
 # ==========================================================
-def cmd_list(args):
+def cmd_grant_nadmin(args):
+    if len(args) != 1:
+        return "Формат: /вдв @username"
+    user_id = resolve_user(args[0])
+    if user_id is None:
+        return "Пользователь " + args[0] + " не найден в VK."
+    with lock:
+        if user_id in NADMIN_IDS:
+            return "[id" + str(user_id) + "|Пользователь] уже имеет доступ к /нлист."
+        NADMIN_IDS.add(user_id)
+        if user_id not in data["nadmins"]:
+            data["nadmins"].append(user_id)
+        save_data()
+        return "[id" + str(user_id) + "|Пользователь] теперь имеет доступ к боту для списка /нлист."
+def cmd_revoke_nadmin(args):
+    if len(args) != 1:
+        return "Формат: /снятьвдв @username"
+    user_id = resolve_user(args[0])
+    if user_id is None:
+        return "Пользователь " + args[0] + " не найден в VK."
+    with lock:
+        if user_id not in NADMIN_IDS:
+            return "[id" + str(user_id) + "|Пользователь] не имеет доступа к /нлист."
+        NADMIN_IDS.discard(user_id)
+        if user_id in data["nadmins"]:
+            data["nadmins"].remove(user_id)
+        save_data()
+        return "У [id" + str(user_id) + "|пользователя] забран доступ к /нлист."
+# ==========================================================
+# СПИСОК / НЛИСТ — баллы (или отпуск/отгул) и ссылка на ВК
+# ==========================================================
+def cmd_list(args, n):
     if args:
-        return "Формат: /список"
+        return "Формат: " + LIST_TITLE[n]
     with lock:
         players = sorted(
-            list(data["players"].values()),
+            list(P(n).values()),
             key=lambda p: (-p["points"], p["nick"].lower()),
         )
         if not players:
@@ -459,45 +530,46 @@ def cmd_list(args):
             else:
                 status = str(p["points"])
             lines.append(str(i) + ". " + p["nick"] + " — " + status + " " + link)
-        return "Участники:\n" + "\n".join(lines)
+        title = "Участники:" if n == 1 else "Участники (нлист):"
+        return title + "\n" + "\n".join(lines)
 # ==========================================================
 # РАЗОСЛАТЬ
 # ==========================================================
-def cmd_broadcast(raw_text):
+def cmd_broadcast(raw_text, n):
     parts = raw_text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         return "Формат: /разослать текст"
     message = parts[1].strip()
     with lock:
-        ids = list(dict.fromkeys(p["vk_id"] for p in data["players"].values()))
-        if not ids:
-            return "Нет привязанных пользователей для рассылки."
-        sent = 0
-        failed = 0
-        for uid in ids:
-            try:
-                vk.messages.send(user_id=uid, message=message, random_id=get_random_id())
-                sent += 1
-            except Exception as e:
-                failed += 1
-                print("Рассылка: не удалось отправить " + str(uid) + ":", repr(e))
-            time.sleep(0.1)
-        return "Рассылка завершена. Отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
+        ids = list(dict.fromkeys(p["vk_id"] for p in P(n).values()))
+    if not ids:
+        return "Нет привязанных пользователей для рассылки."
+    sent = 0
+    failed = 0
+    for uid in ids:
+        try:
+            vk.messages.send(user_id=uid, message=message, random_id=get_random_id())
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print("Рассылка: не удалось отправить " + str(uid) + ":", repr(e))
+        time.sleep(0.1)
+    return "Рассылка завершена (" + LIST_TITLE[n] + "). Отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
 # ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
-def cmd_points(user_id):
+def cmd_points(user_id, n):
     with lock:
-        player = find_by_id(user_id)
+        player = find_by_id(n, user_id)
         if player is None:
             return "Вы не привязаны к нику. Обратитесь к администратору."
         return player["nick"] + ", у вас " + str(player["points"]) + " баллов."
 # ==========================================================
 # МАГАЗИН
 # ==========================================================
-def cmd_shop():
+def cmd_shop(n):
     with lock:
-        shop = list(data["shop"])
+        shop = list(S(n))
         if not shop:
             return "Магазин пуст."
         lines = [
@@ -505,17 +577,18 @@ def cmd_shop():
             for i, item in enumerate(shop, 1)
         ]
         return "Магазин:\n" + "\n".join(lines) + "\n\nКупить: /купить номер"
-def cmd_buy(args, user_id):
+def cmd_buy(args, user_id, n):
     if len(args) != 1 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /купить 1"
     num = int(args[0])
     with lock:
-        player = find_by_id(user_id)
+        player = find_by_id(n, user_id)
         if player is None:
             return "Вы не привязаны к нику. Обратитесь к администратору."
-        if num < 1 or num > len(data["shop"]):
+        shop = S(n)
+        if num < 1 or num > len(shop):
             return "Товара с таким номером нет."
-        item = data["shop"][num - 1]
+        item = shop[num - 1]
         if player["points"] < item["price"]:
             return "Не хватает баллов. Нужно " + str(item["price"]) + ", у вас " + str(player["points"]) + "."
         item_name = item["name"]
@@ -536,14 +609,18 @@ def cmd_buy(args, user_id):
             answer = "Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
 
         save_data()
-        # Уведомление админам при ЛЮБОЙ покупке (включая отгул и отпуск)
-        executor.submit(
-            notify_admins,
+        # Уведомление при ЛЮБОЙ покупке (включая отгул и отпуск):
+        # список 1 -> общим админам, /нлист -> только тем, кто получил /вдв
+        text = (
             "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
-            + item_name + " (" + str(item_price) + " баллов). Выдайте ему.",
+            + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
         )
+        if n == 1:
+            executor.submit(notify_admins, text)
+        else:
+            executor.submit(notify_nadmins, "[/нлист] " + text)
         return answer
-def cmd_shop_add(args):
+def cmd_shop_add(args, n):
     if len(args) < 2 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /+магазин 100 что выдать"
     price = int(args[0])
@@ -551,21 +628,22 @@ def cmd_shop_add(args):
         return "Цена должна быть больше 0."
     name = " ".join(args[1:])
     with lock:
-        data["shop"].append({"name": name, "price": price})
-        num = len(data["shop"])
+        S(n).append({"name": name, "price": price})
+        num = len(S(n))
         save_data()
-        return "Товар добавлен под номером " + str(num) + ": " + name + " — " + str(price) + " баллов."
-def cmd_shop_remove(args):
+        return "Товар добавлен (" + LIST_TITLE[n] + ") под номером " + str(num) + ": " + name + " — " + str(price) + " баллов."
+def cmd_shop_remove(args, n):
     if len(args) != 1 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /-магазин 3"
     num = int(args[0])
     with lock:
-        if num < 1 or num > len(data["shop"]):
+        shop = S(n)
+        if num < 1 or num > len(shop):
             return "Товара с таким номером нет."
-        item = data["shop"].pop(num - 1)
+        item = shop.pop(num - 1)
         item_name = item["name"]
         save_data()
-        return "Товар удалён: " + item_name + "."
+        return "Товар удалён (" + LIST_TITLE[n] + "): " + item_name + "."
 # ==========================================================
 # HELP
 # ==========================================================
@@ -583,21 +661,93 @@ ADMIN_HELP = (
     "/магазин — список товаров\n"
     "/купить (номер) — купить товар\n"
     "/help — список команд\n\n"
-    "Для администраторов:\n"
+    "Для администраторов (два независимых списка: /список и /нлист):\n"
+    "/список — список участников с баллами\n"
+    "/нлист — второй список участников\n"
+    "/привязать1 @username Nick_Name — привязать в /список\n"
+    "/привязать2 @username Nick_Name — привязать в /нлист\n"
+    "/+магазин1 100 товар — добавить товар в магазин /список\n"
+    "/+магазин2 100 товар — добавить товар в магазин /нлист\n"
+    "/-магазин1 3 и /-магазин2 3 — удалить товар по номеру\n"
+    "/разослать1 текст и /разослать2 текст — рассылка по списку\n"
+    "/выдать Nick_Name 5 — выдать баллы\n"
+    "/забрать Nick_Name 5 — забрать баллы\n"
+    "/отвязать @username или Nick_Name — отвязать игрока\n"
+    "/изменить Старый Новый — сменить ник\n"
+    "(выдать/забрать/отвязать/изменить сами находят список по нику; "
+    "если ник есть в обоих — добавьте 1 или 2: /выдать2 Nick 5)\n"
+    "/вд @username — выдать полный доступ админа\n"
+    "/снятьвд @username — забрать доступ админа\n"
+    "/вдв @username — выдать доступ только к списку /нлист\n"
+    "/снятьвдв @username — забрать доступ к /нлист"
+)
+NADMIN_HELP = (
+    "Все команды:\n\n"
+    "Для всех:\n"
+    "/баллы — узнать свои баллы\n"
+    "/магазин — список товаров\n"
+    "/купить (номер) — купить товар\n"
+    "/help — список команд\n\n"
+    "Для администратора /нлист:\n"
+    "/нлист — список участников с баллами\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
     "/привязать @username Nick_Name — привязать игрока\n"
     "/отвязать @username или Nick_Name — отвязать игрока\n"
     "/изменить Старый Новый — сменить ник\n"
-    "/список — список участников с баллами\n"
     "/разослать текст — рассылка привязанным игрокам\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
-    "/-магазин 3 — удалить товар из магазина по номеру\n"
-    "/вд @username — выдать полный доступ админа\n"
-    "/снятьвд @username — забрать доступ админа"
+    "/-магазин 3 — удалить товар из магазина по номеру"
 )
 def cmd_help(user_id):
-    return ADMIN_HELP if user_id in ALLOWED_IDS else USER_HELP
+    if user_id in ALLOWED_IDS:
+        return ADMIN_HELP
+    if user_id in NADMIN_IDS:
+        return NADMIN_HELP
+    return USER_HELP
+# ==========================================================
+# РАЗБОР КОМАНД С НОМЕРОМ СПИСКА (/привязать1, /привязать2 ...)
+# ==========================================================
+LIST_COMMANDS = {
+    "/выдать", "/забрать", "/привязать", "/отвязать", "/убрать",
+    "/изменить", "/+магазин", "/-магазин", "/разослать",
+    "/баллы", "/магазин", "/купить",
+}
+# Эти команды общий админ ОБЯЗАН вводить с номером списка
+NEED_SUFFIX = {"/привязать", "/+магазин", "/-магазин", "/разослать"}
+def split_command(cmd):
+    """'/привязать2' -> ('/привязать', 2); '/привязать' -> ('/привязать', None)"""
+    if len(cmd) > 1 and cmd[-1] in "12" and cmd[:-1] in LIST_COMMANDS:
+        return cmd[:-1], int(cmd[-1])
+    return cmd, None
+def ask_suffix(command):
+    return (
+        "Укажите, для какого списка:\n"
+        + command + "1 — для /список\n"
+        + command + "2 — для /нлист"
+    )
+def auto_ctx(command, args):
+    """Для общего админа без номера: определить список по нику (или id).
+    Возвращает 1/2 либо строку с просьбой уточнить."""
+    if not args:
+        return 1
+    target = args[0]
+    with lock:
+        found = [n for n in (1, 2) if find_by_nick(n, target) is not None]
+    if not found and command in ("/отвязать", "/убрать"):
+        user_id = resolve_user(target)
+        if user_id is not None:
+            with lock:
+                found = [n for n in (1, 2) if find_by_id(n, user_id) is not None]
+    if len(found) == 2:
+        return (
+            "«" + target + "» есть в обоих списках. Уточните:\n"
+            + command + "1 — /список\n"
+            + command + "2 — /нлист"
+        )
+    if len(found) == 1:
+        return found[0]
+    return 1  # не найден нигде — команда сама ответит «не найден»
 # ==========================================================
 # ОБРАБОТКА АДМИНСКИХ КОМАНД
 # ==========================================================
@@ -605,31 +755,76 @@ def handle(text, user_id):
     parts = text.strip().split()
     if not parts:
         return None
-    command = parts[0].lower()
+    raw_cmd = parts[0].lower()
     args = parts[1:]
+    is_common = user_id in ALLOWED_IDS
+    is_nadmin = user_id in NADMIN_IDS
+
+    # Просмотр списков
+    if raw_cmd in ("/нлист", "/nlist"):
+        return cmd_list(args, 2)
+    if raw_cmd == "/список":
+        return cmd_list(args, 1) if is_common else None
+
+    # Управление доступом — только общие админы
+    if raw_cmd == "/вд":
+        return cmd_grant_admin(args) if is_common else None
+    if raw_cmd == "/снятьвд":
+        return cmd_revoke_admin(args) if is_common else None
+    if raw_cmd == "/вдв":
+        return cmd_grant_nadmin(args) if is_common else None
+    if raw_cmd == "/снятьвдв":
+        return cmd_revoke_nadmin(args) if is_common else None
+
+    command, suffix = split_command(raw_cmd)
+    if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить"):
+        return None
+
+    # Определяем, с каким списком работаем
+    if is_common:
+        n = suffix
+        if n is None:
+            if command in NEED_SUFFIX:
+                return ask_suffix(command)
+            n = auto_ctx(command, args)
+            if isinstance(n, str):
+                return n
+    elif is_nadmin:
+        if suffix == 1:
+            return None
+        n = 2
+    else:
+        return None
+
     if command == "/выдать":
-        return cmd_give(args, +1)
+        return cmd_give(args, +1, n)
     if command == "/забрать":
-        return cmd_give(args, -1)
+        return cmd_give(args, -1, n)
     if command == "/привязать":
-        return cmd_bind(args)
+        return cmd_bind(args, n)
     if command in ("/отвязать", "/убрать"):
-        return cmd_unbind(args)
+        return cmd_unbind(args, n)
     if command == "/изменить":
-        return cmd_change(args)
-    if command == "/список":
-        return cmd_list(args)
+        return cmd_change(args, n)
     if command == "/+магазин":
-        return cmd_shop_add(args)
+        return cmd_shop_add(args, n)
     if command == "/-магазин":
-        return cmd_shop_remove(args)
+        return cmd_shop_remove(args, n)
     if command == "/разослать":
-        return cmd_broadcast(text)
-    if command == "/вд":
-        return cmd_grant_admin(args)
-    if command == "/снятьвд":
-        return cmd_revoke_admin(args)
+        return cmd_broadcast(text, n)
     return None
+# ==========================================================
+# СПИСОК ПОЛЬЗОВАТЕЛЯ ДЛЯ ПУБЛИЧНЫХ КОМАНД
+# ==========================================================
+def public_ctx(user_id, suffix):
+    if suffix in (1, 2):
+        return suffix
+    with lock:
+        in1 = find_by_id(1, user_id) is not None
+        in2 = find_by_id(2, user_id) is not None
+    if in2 and not in1:
+        return 2
+    return 1
 # ==========================================================
 # ОБРАБОТКА СОБЫТИЯ VK
 # ==========================================================
@@ -645,35 +840,39 @@ def process_event(event):
     # === Ожидание даты отпуска: игрок пишет просто дату без команды ===
     if not text.startswith("/"):
         with lock:
-            player = find_by_id(from_id)
-            if player and player.get("waiting_vacation"):
-                date = text.strip()
-                if re.fullmatch(r"\d{1,2}\.\d{1,2}(\.\d{2,4})?", date):
-                    player["vacation"] = date
-                    player["waiting_vacation"] = False
-                    save_data()
-                    reply(peer_id, "Отпуск зафиксирован до " + date + ".")
-                else:
-                    reply(peer_id, "Напишите дату в формате ДД.ММ (например 15.12):")
+            for n in (1, 2):
+                player = find_by_id(n, from_id)
+                if player and player.get("waiting_vacation"):
+                    date = text.strip()
+                    if re.fullmatch(r"\d{1,2}\.\d{1,2}(\.\d{2,4})?", date):
+                        player["vacation"] = date
+                        player["waiting_vacation"] = False
+                        save_data()
+                        reply(peer_id, "Отпуск зафиксирован до " + date + ".")
+                    else:
+                        reply(peer_id, "Напишите дату в формате ДД.ММ (например 15.12):")
+                    break
         return
     # ======================================================
     # ПУБЛИЧНЫЕ КОМАНДЫ (доступны всем)
     # ======================================================
     parts = text.split()
-    command = parts[0].lower()
+    raw_cmd = parts[0].lower()
     args = parts[1:]
+    command, suffix = split_command(raw_cmd)
     is_public = True
     public_answer = None
     try:
         if command == "/баллы":
-            public_answer = "Формат: /баллы" if args else cmd_points(from_id)
-        elif command in ("/help", "/хелп"):
+            n = public_ctx(from_id, suffix)
+            public_answer = "Формат: /баллы" if args else cmd_points(from_id, n)
+        elif raw_cmd in ("/help", "/хелп"):
             public_answer = cmd_help(from_id)
         elif command == "/магазин":
-            public_answer = cmd_shop()
+            public_answer = cmd_shop(public_ctx(from_id, suffix))
         elif command == "/купить":
-            public_answer = cmd_buy(args, from_id)
-        elif command == "/я":
+            public_answer = cmd_buy(args, from_id, public_ctx(from_id, suffix))
+        elif raw_cmd == "/я":
             public_answer = "Ваш VK ID: " + str(from_id)
         else:
             is_public = False
@@ -685,9 +884,9 @@ def process_event(event):
             reply(peer_id, public_answer)
         return
     # ======================================================
-    # ВСЕ ОСТАЛЬНЫЕ КОМАНДЫ — только ALLOWED_IDS
+    # ВСЕ ОСТАЛЬНЫЕ КОМАНДЫ — только админы (общие или /вдв)
     # ======================================================
-    if from_id not in ALLOWED_IDS:
+    if from_id not in ALLOWED_IDS and from_id not in NADMIN_IDS:
         return
     try:
         answer = handle(text, from_id)
@@ -721,8 +920,9 @@ def main():
         print("ВНИМАНИЕ: GIST_TOKEN/GIST_ID не заданы — данные хранятся только локально!")
     load_data()
     print(
-        "Игроков: " + str(len(data["players"])) + ", "
-        + "товаров: " + str(len(data["shop"])) + ", админов: " + str(len(ALLOWED_IDS))
+        "Список 1: игроков " + str(len(data["players"])) + ", товаров " + str(len(data["shop"]))
+        + " | /нлист: игроков " + str(len(data["nplayers"])) + ", товаров " + str(len(data["nshop"]))
+        + " | общих админов: " + str(len(ALLOWED_IDS)) + ", админов /нлист: " + str(len(NADMIN_IDS))
     )
     while True:
         try:
