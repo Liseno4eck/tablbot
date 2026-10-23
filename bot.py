@@ -5,6 +5,7 @@ import time
 import threading
 import urllib.request
 import urllib.error
+from datetime import datetime, timedelta, timezone, date
 import vk_api
 from concurrent.futures import ThreadPoolExecutor
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
@@ -28,6 +29,9 @@ NADMIN_IDS = set()
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 GIST_TOKEN_FALLBACK = ""
 GIST_ID_FALLBACK = ""
+# Всё время (даты отпуска) считается по Москве
+MSK = timezone(timedelta(hours=3))
+DEFAULT_VACATION_MAX_DAYS = 4
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -50,7 +54,12 @@ executor = ThreadPoolExecutor(max_workers=8)
 # ХРАНИЛИЩЕ
 # Список 1 (/список):  players, shop, admins
 # Список 2 (/нлист):   nplayers, nshop, nadmins
-# players: nick_lower -> {nick, vk_id, points, vacation, otgul, waiting_vacation}
+# players: nick_lower -> {
+#   nick, vk_id, points, vacation (строка для показа), otgul,
+#   vac_stage (None | "date" | "incl"),
+#   vac_max (макс. дней), vac_pending (данные покупки до подтверждения),
+#   vac_end (ISO дата окончания), vac_incl (True/False/None)
+# }
 # ==========================================================
 lock = threading.RLock()
 save_lock = threading.Lock()
@@ -63,6 +72,9 @@ def P(n):
     return data["players"] if n == 1 else data["nplayers"]
 def S(n):
     return data["shop"] if n == 1 else data["nshop"]
+def today_local():
+    """Сегодняшняя дата по Москве."""
+    return datetime.now(MSK).date()
 def _http_error_text(e):
     try:
         if hasattr(e, "read"):
@@ -207,13 +219,34 @@ def _norm_players(raw_players):
                 otgul = 0
             if not nick or vk_id <= 0:
                 continue
+            # стадия ожидания отпуска (с совместимостью со старым waiting_vacation)
+            vac_stage = value.get("vac_stage")
+            if vac_stage not in ("date", "incl"):
+                vac_stage = None
+            vac_pending = value.get("vac_pending")
+            if not isinstance(vac_pending, dict):
+                vac_pending = None
+            if value.get("waiting_vacation") and vac_stage is None:
+                vac_stage = "date"
+                vac_pending = vac_pending or {"num": 0, "item": "отпуск", "price": 0}
+            try:
+                vac_max = int(value.get("vac_max", DEFAULT_VACATION_MAX_DAYS))
+            except (TypeError, ValueError):
+                vac_max = DEFAULT_VACATION_MAX_DAYS
+            vac_incl = value.get("vac_incl")
+            if vac_incl not in (True, False):
+                vac_incl = None
             players[nick.lower()] = {
                 "nick": nick,
                 "vk_id": vk_id,
                 "points": points,
                 "vacation": value.get("vacation"),
                 "otgul": otgul,
-                "waiting_vacation": bool(value.get("waiting_vacation", False)),
+                "vac_stage": vac_stage,
+                "vac_max": vac_max,
+                "vac_pending": vac_pending,
+                "vac_end": value.get("vac_end"),
+                "vac_incl": vac_incl,
             }
     return players
 def _norm_shop(raw_shop):
@@ -301,6 +334,86 @@ def find_by_id(n, vk_id):
             return p
     return None
 # ==========================================================
+# ОТПУСК: даты и актуальность (время по МСК)
+# ==========================================================
+DATE_RE = r"(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?"
+def parse_vacation_date(text):
+    """'15.12' или '15.12.2026' -> date. Без года: ближайшая дата, не раньше сегодня (МСК)."""
+    match = re.fullmatch(DATE_RE, text.strip())
+    if not match:
+        return None
+    day = int(match.group(1))
+    month = int(match.group(2))
+    year_raw = match.group(3)
+    today = today_local()
+    try:
+        if year_raw:
+            year = int(year_raw)
+            if year < 100:
+                year += 2000
+            return date(year, month, day)
+        result = date(today.year, month, day)
+        if result < today:
+            result = date(today.year + 1, month, day)
+        return result
+    except ValueError:
+        return None
+def format_date(d):
+    if d.year == today_local().year:
+        return d.strftime("%d.%m")
+    return d.strftime("%d.%m.%Y")
+def vacation_max_days_from_name(name):
+    match = re.search(r"до\s*(\d+)\s*дн", name.lower())
+    if match:
+        return int(match.group(1))
+    return DEFAULT_VACATION_MAX_DAYS
+def is_vacation_item(name):
+    return name.lower().strip().startswith("отпуск")
+def _clear_vacation(player):
+    player["vacation"] = None
+    player["vac_end"] = None
+    player["vac_incl"] = None
+def vacation_active(player):
+    """Возвращает (active, changed). Просроченный отпуск сбрасывается.
+    Не включительно: в дату окончания уже показываются баллы.
+    Включительно: дата окончания ещё отпуск, со следующего дня баллы."""
+    vacation = player.get("vacation")
+    if not vacation:
+        return False, False
+    end = None
+    end_iso = player.get("vac_end")
+    if end_iso:
+        try:
+            end = date.fromisoformat(end_iso)
+        except ValueError:
+            end = None
+    incl = player.get("vac_incl")
+    if end is None:
+        # старые записи без точной даты: пробуем разобрать строку
+        match = re.fullmatch(DATE_RE, str(vacation).strip())
+        if not match:
+            return True, False
+        try:
+            year_raw = match.group(3)
+            if year_raw:
+                year = int(year_raw)
+                if year < 100:
+                    year += 2000
+            else:
+                year = today_local().year
+            end = date(year, int(match.group(2)), int(match.group(1)))
+        except ValueError:
+            return True, False
+        incl = True
+    if incl is None:
+        incl = True
+    today = today_local()
+    expired = (today > end) if incl else (today >= end)
+    if expired:
+        _clear_vacation(player)
+        return False, True
+    return True, False
+# ==========================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
 def reply(peer_id, text):
@@ -326,6 +439,11 @@ def notify_nadmins(text):
             vk.messages.send(user_id=admin_id, message=text, random_id=get_random_id())
         except Exception as e:
             print("Не удалось написать " + str(admin_id) + ":", repr(e))
+def notify_for_list(n, text):
+    if n == 1:
+        executor.submit(notify_admins, text)
+    else:
+        executor.submit(notify_nadmins, "[/нлист] " + text)
 # ==========================================================
 # ОПРЕДЕЛЕНИЕ VK ID
 # ==========================================================
@@ -374,6 +492,19 @@ def cmd_give(args, sign, n):
 # ==========================================================
 # ПРИВЯЗАТЬ
 # ==========================================================
+def new_player(nick, user_id):
+    return {
+        "nick": nick,
+        "vk_id": user_id,
+        "points": 0,
+        "vacation": None,
+        "otgul": 0,
+        "vac_stage": None,
+        "vac_max": DEFAULT_VACATION_MAX_DAYS,
+        "vac_pending": None,
+        "vac_end": None,
+        "vac_incl": None,
+    }
 def cmd_bind(args, n):
     if len(args) != 2:
         return "Формат: /привязать @username Nick_Name"
@@ -387,14 +518,7 @@ def cmd_bind(args, n):
         existing = find_by_id(n, user_id)
         if existing is not None:
             return "Этот пользователь уже привязан к нику " + existing["nick"] + " (" + LIST_TITLE[n] + ")."
-        P(n)[nick.lower()] = {
-            "nick": nick,
-            "vk_id": user_id,
-            "points": 0,
-            "vacation": None,
-            "otgul": 0,
-            "waiting_vacation": False,
-        }
+        P(n)[nick.lower()] = new_player(nick, user_id)
         save_data()
         return "Игрок " + nick + " привязан к https://vk.com/id" + str(user_id) + " (" + LIST_TITLE[n] + ")."
 # ==========================================================
@@ -512,6 +636,12 @@ def cmd_list(args, n):
     if args:
         return "Формат: " + LIST_TITLE[n]
     with lock:
+        changed = False
+        for p in P(n).values():
+            _, ch = vacation_active(p)
+            changed = changed or ch
+        if changed:
+            save_data()
         players = sorted(
             list(P(n).values()),
             key=lambda p: (-p["points"], p["nick"].lower()),
@@ -524,7 +654,7 @@ def cmd_list(args, n):
             otgul = p.get("otgul", 0)
             link = "(vk.com/id" + str(p["vk_id"]) + ")"
             if vacation:
-                status = "отпуск до " + vacation
+                status = "отпуск до " + str(vacation)
             elif otgul:
                 status = "отгул"
             else:
@@ -585,6 +715,8 @@ def cmd_buy(args, user_id, n):
         player = find_by_id(n, user_id)
         if player is None:
             return "Вы не привязаны к нику. Обратитесь к администратору."
+        if player.get("vac_stage"):
+            return "Сначала завершите оформление отпуска: ответьте на вопрос бота."
         shop = S(n)
         if num < 1 or num > len(shop):
             return "Товара с таким номером нет."
@@ -599,27 +731,100 @@ def cmd_buy(args, user_id, n):
         player["points"] -= item_price
         left = player["points"]
 
+        if is_vacation_item(item_name):
+            # Админам НЕ пишем сейчас: уведомление уйдёт после ответа да/нет
+            max_days = vacation_max_days_from_name(item_name)
+            player["vac_stage"] = "date"
+            player["vac_max"] = max_days
+            player["vac_pending"] = {"num": num, "item": item_name, "price": item_price}
+            save_data()
+            return (
+                "Ваш отпуск оплачен! Напишите дату окончания отпуска в формате ДД.ММ "
+                "(например 15.12). Максимум до " + str(max_days) + " дн. от сегодняшнего дня (МСК):"
+            )
+
         if name_lower == "отгул":
             player["otgul"] = player.get("otgul", 0) + 1
             answer = "Вы купили отгул! Осталось баллов: " + str(left) + "."
-        elif name_lower == "отпуск":
-            player["waiting_vacation"] = True
-            answer = "Ваш отпуск оплачен! Напишите дату окончания в формате ДД.ММ (например 15.12):"
         else:
             answer = "Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
 
         save_data()
-        # Уведомление при ЛЮБОЙ покупке (включая отгул и отпуск):
-        # список 1 -> общим админам, /нлист -> только тем, кто получил /вдв
+        # Уведомление при покупке (кроме отпуска): список 1 -> общим админам,
+        # /нлист -> только тем, кто получил /вдв
         text = (
             "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
             + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
         )
-        if n == 1:
-            executor.submit(notify_admins, text)
-        else:
-            executor.submit(notify_nadmins, "[/нлист] " + text)
+        notify_for_list(n, text)
         return answer
+# ==========================================================
+# ОТПУСК: диалог после покупки (дата -> включительно да/нет)
+# ==========================================================
+YES_WORDS = {"да", "д", "yes", "y", "+", "дa"}
+NO_WORDS = {"нет", "н", "no", "n", "-", "нeт"}
+def handle_vacation_reply(player, user_id, n, text):
+    """Вызывается под lock. Возвращает текст ответа игроку."""
+    stage = player.get("vac_stage")
+    pending = player.get("vac_pending") or {}
+    max_days = player.get("vac_max", DEFAULT_VACATION_MAX_DAYS)
+    answer = text.strip().lower()
+
+    if stage == "date":
+        end = parse_vacation_date(text)
+        if end is None:
+            return "Напишите дату в формате ДД.ММ (например 15.12):"
+        days = (end - today_local()).days
+        if days < 0:
+            return "Эта дата уже прошла. Напишите дату в формате ДД.ММ (например 15.12):"
+        if days > max_days:
+            return (
+                "Отпуск максимум до " + str(max_days) + " дн. от сегодняшнего дня. "
+                "Напишите более раннюю дату (ДД.ММ):"
+            )
+        pending["end"] = end.isoformat()
+        player["vac_pending"] = pending
+        player["vac_stage"] = "incl"
+        save_data()
+        return "Отпуск до " + format_date(end) + " включительно? Ответьте: да / нет"
+
+    if stage == "incl":
+        if answer in YES_WORDS:
+            incl = True
+        elif answer in NO_WORDS:
+            incl = False
+        else:
+            return "Ответьте «да» или «нет»: отпуск до этого числа включительно?"
+        try:
+            end = date.fromisoformat(pending.get("end", ""))
+        except ValueError:
+            player["vac_stage"] = "date"
+            save_data()
+            return "Напишите дату окончания отпуска в формате ДД.ММ (например 15.12):"
+        date_text = format_date(end)
+        player["vacation"] = date_text
+        player["vac_end"] = end.isoformat()
+        player["vac_incl"] = incl
+        player["vac_stage"] = None
+        player["vac_pending"] = None
+        save_data()
+        incl_text = "включительно" if incl else "не включительно"
+        nick = player["nick"]
+        item_name = pending.get("item") or "отпуск"
+        item_price = pending.get("price", 0)
+        num = pending.get("num", 0)
+        notify_text = (
+            "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил отпуск до "
+            + date_text + " " + incl_text + " (№" + str(num) + ": " + item_name
+            + ", " + str(item_price) + " баллов). Выдайте ему."
+        )
+        notify_for_list(n, notify_text)
+        return "Отпуск зафиксирован до " + date_text + " " + incl_text + "."
+
+    return None
+# ==========================================================
+# МАГАЗИН: добавить / удалить
+# ==========================================================
 def cmd_shop_add(args, n):
     if len(args) < 2 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /+магазин 100 что выдать"
@@ -679,7 +884,10 @@ ADMIN_HELP = (
     "/вд @username — выдать полный доступ админа\n"
     "/снятьвд @username — забрать доступ админа\n"
     "/вдв @username — выдать доступ только к списку /нлист\n"
-    "/снятьвдв @username — забрать доступ к /нлист"
+    "/снятьвдв @username — забрать доступ к /нлист\n\n"
+    "Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин. "
+    "После покупки бот спросит дату и «включительно да/нет», затем уведомит админов. "
+    "Время считается по МСК."
 )
 NADMIN_HELP = (
     "Все команды:\n\n"
@@ -837,20 +1045,15 @@ def process_event(event):
     from_id = msg["from_id"]
     if DEBUG:
         print("Сообщение от " + str(from_id) + ": " + repr(text))
-    # === Ожидание даты отпуска: игрок пишет просто дату без команды ===
+    # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
         with lock:
             for n in (1, 2):
                 player = find_by_id(n, from_id)
-                if player and player.get("waiting_vacation"):
-                    date = text.strip()
-                    if re.fullmatch(r"\d{1,2}\.\d{1,2}(\.\d{2,4})?", date):
-                        player["vacation"] = date
-                        player["waiting_vacation"] = False
-                        save_data()
-                        reply(peer_id, "Отпуск зафиксирован до " + date + ".")
-                    else:
-                        reply(peer_id, "Напишите дату в формате ДД.ММ (например 15.12):")
+                if player and player.get("vac_stage"):
+                    answer = handle_vacation_reply(player, from_id, n, text)
+                    if answer:
+                        reply(peer_id, answer)
                     break
         return
     # ======================================================
@@ -924,6 +1127,7 @@ def main():
         + " | /нлист: игроков " + str(len(data["nplayers"])) + ", товаров " + str(len(data["nshop"]))
         + " | общих админов: " + str(len(ALLOWED_IDS)) + ", админов /нлист: " + str(len(NADMIN_IDS))
     )
+    print("Сегодня (МСК):", today_local().isoformat())
     while True:
         try:
             longpoll = VkBotLongPoll(vk_session, GROUP_ID)
