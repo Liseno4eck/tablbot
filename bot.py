@@ -32,6 +32,8 @@ GIST_ID_FALLBACK = ""
 # Всё время (даты отпуска) считается по Москве
 MSK = timezone(timedelta(hours=3))
 DEFAULT_VACATION_MAX_DAYS = 4
+# Сколько мест показывать в /топ
+TOP_LIMIT = 10
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -663,6 +665,86 @@ def cmd_list(args, n):
         title = "Участники:" if n == 1 else "Участники (нлист):"
         return title + "\n" + "\n".join(lines)
 # ==========================================================
+# ТОП ПО БАЛЛАМ
+# ==========================================================
+def _format_top(players, title):
+    players = sorted(players, key=lambda p: (-p["points"], p["nick"].lower()))
+    if not players:
+        return title + "\nСписок пуст."
+    lines = []
+    for i, p in enumerate(players[:TOP_LIMIT], 1):
+        lines.append(str(i) + ". " + p["nick"] + " — " + str(p["points"]))
+    return title + "\n" + "\n".join(lines)
+def cmd_top(n):
+    """Топ по баллам одного списка (n = 1 или 2)."""
+    with lock:
+        players = list(P(n).values())
+    if n == 1:
+        title = "Топ по баллам (/список):"
+    else:
+        title = "Топ по баллам (/нлист):"
+    return _format_top(players, title)
+def cmd_top_all():
+    """Общий топ по баллам из обоих списков."""
+    with lock:
+        players = list(P(1).values()) + list(P(2).values())
+    return _format_top(players, "Общий топ по баллам:")
+def handle_top(user_id, suffix, args):
+    """/топ, /топ1, /топ2, /топ общий.
+    Доступ: все, кто привязан хотя бы в одном списке, и админы."""
+    is_common = user_id in ALLOWED_IDS
+    is_nadmin = user_id in NADMIN_IDS
+    with lock:
+        bound1 = find_by_id(1, user_id) is not None
+        bound2 = find_by_id(2, user_id) is not None
+    if not (is_common or is_nadmin or bound1 or bound2):
+        return "Вы не привязаны к нику. Обратитесь к администратору."
+
+    # /топ общий (а также /топобщий)
+    if args and args[0].lower() in ("общий", "общ"):
+        return cmd_top_all()
+    if args:
+        return "Формат: /топ или /топ общий"
+
+    # Общий админ: /топ1 -> /список, /топ2 -> /нлист
+    if is_common:
+        if suffix in (1, 2):
+            return cmd_top(suffix)
+        if bound1 and not bound2:
+            return cmd_top(1)
+        if bound2 and not bound1:
+            return cmd_top(2)
+        return (
+            "Укажите, для какого списка:\n"
+            "/топ1 — для /список\n"
+            "/топ2 — для /нлист\n"
+            "/топ общий — общий топ"
+        )
+
+    # Админ /нлист (/вдв): только свой список
+    if is_nadmin and not bound1:
+        if suffix == 1:
+            return "Нет доступа к списку /список."
+        return cmd_top(2)
+
+    # Обычный участник: свой список
+    if suffix == 1 and bound1:
+        return cmd_top(1)
+    if suffix == 2 and bound2:
+        return cmd_top(2)
+    if bound1 and not bound2:
+        return cmd_top(1)
+    if bound2 and not bound1:
+        return cmd_top(2)
+    if bound1 and bound2:
+        return (
+            "Вы состоите в обоих списках. Уточните:\n"
+            "/топ1 — для /список\n"
+            "/топ2 — для /нлист\n"
+            "/топ общий — общий топ"
+        )
+    return cmd_top(2)
+# ==========================================================
 # РАЗОСЛАТЬ
 # ==========================================================
 def cmd_broadcast(raw_text, n):
@@ -855,6 +937,8 @@ def cmd_shop_remove(args, n):
 USER_HELP = (
     "Ваши команды:\n"
     "/баллы\n"
+    "/топ — топ по баллам\n"
+    "/топ общий — общий топ\n"
     "/магазин\n"
     "/купить\n"
     "/help — список команд"
@@ -863,12 +947,16 @@ ADMIN_HELP = (
     "Все команды:\n\n"
     "Для всех:\n"
     "/баллы — узнать свои баллы\n"
+    "/топ — топ по баллам своего списка\n"
+    "/топ общий — общий топ из обоих списков\n"
     "/магазин — список товаров\n"
     "/купить (номер) — купить товар\n"
     "/help — список команд\n\n"
     "Для администраторов (два независимых списка: /список и /нлист):\n"
     "/список — список участников с баллами\n"
     "/нлист — второй список участников\n"
+    "/топ1 — топ по баллам списка /список\n"
+    "/топ2 — топ по баллам списка /нлист\n"
     "/привязать1 @username Nick_Name — привязать в /список\n"
     "/привязать2 @username Nick_Name — привязать в /нлист\n"
     "/+магазин1 100 товар — добавить товар в магазин /список\n"
@@ -893,6 +981,8 @@ NADMIN_HELP = (
     "Все команды:\n\n"
     "Для всех:\n"
     "/баллы — узнать свои баллы\n"
+    "/топ — топ по баллам\n"
+    "/топ общий — общий топ из обоих списков\n"
     "/магазин — список товаров\n"
     "/купить (номер) — купить товар\n"
     "/help — список команд\n\n"
@@ -919,7 +1009,7 @@ def cmd_help(user_id):
 LIST_COMMANDS = {
     "/выдать", "/забрать", "/привязать", "/отвязать", "/убрать",
     "/изменить", "/+магазин", "/-магазин", "/разослать",
-    "/баллы", "/магазин", "/купить",
+    "/баллы", "/магазин", "/купить", "/топ",
 }
 # Эти команды общий админ ОБЯЗАН вводить с номером списка
 NEED_SUFFIX = {"/привязать", "/+магазин", "/-магазин", "/разослать"}
@@ -985,7 +1075,7 @@ def handle(text, user_id):
         return cmd_revoke_nadmin(args) if is_common else None
 
     command, suffix = split_command(raw_cmd)
-    if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить"):
+    if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
         return None
 
     # Определяем, с каким списком работаем
@@ -1075,6 +1165,10 @@ def process_event(event):
             public_answer = cmd_shop(public_ctx(from_id, suffix))
         elif command == "/купить":
             public_answer = cmd_buy(args, from_id, public_ctx(from_id, suffix))
+        elif raw_cmd in ("/топобщий", "/топ_общий"):
+            public_answer = handle_top(from_id, None, ["общий"])
+        elif command == "/топ":
+            public_answer = handle_top(from_id, suffix, args)
         elif raw_cmd == "/я":
             public_answer = "Ваш VK ID: " + str(from_id)
         else:
