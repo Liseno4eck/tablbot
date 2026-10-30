@@ -911,7 +911,7 @@ def cmd_write(msg, from_id, text):
     body_text = parts[1].strip()
     name = get_user_name(from_id)
     kb = VkKeyboard(inline=True)
-    kb.add_openlink_button("💬 В чат", "https://vk.com/im?sel=" + str(from_id))
+    kb.add_openlink_button("💬 В чат", "https://vk.com/gim" + str(GROUP_ID) + "?sel=" + str(from_id))
     keyboard = kb.get_keyboard()
     header = "📩 Сообщение от [id" + str(from_id) + "|" + name + "]"
     sent = False
