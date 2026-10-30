@@ -2,6 +2,7 @@ import os
 import re
 import json
 import time
+import zlib
 import threading
 import urllib.request
 import urllib.error
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta, timezone, date
 import vk_api
 from concurrent.futures import ThreadPoolExecutor
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 # ==========================================================
 # НАСТРОЙКИ
@@ -26,6 +28,9 @@ ALLOWED_IDS = {
 BASE_ADMIN_IDS = set(ALLOWED_IDS)
 # Админы второго списка (/нлист): выдаются командой /вдв
 NADMIN_IDS = set()
+# Владелец: ТОЛЬКО ему приходят обращения из /написать.
+# Поменяйте на свой VK ID (или задайте переменную окружения OWNER_ID)
+OWNER_ID = int(os.environ.get("OWNER_ID", "875762552"))
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
 GIST_TOKEN_FALLBACK = ""
 GIST_ID_FALLBACK = ""
@@ -34,6 +39,8 @@ MSK = timezone(timedelta(hours=3))
 DEFAULT_VACATION_MAX_DAYS = 4
 # Сколько мест показывать в /топ
 TOP_LIMIT = 10
+# Сколько товаров на одной странице кнопок магазина
+SHOP_PER_PAGE = 6
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -56,11 +63,13 @@ executor = ThreadPoolExecutor(max_workers=8)
 # ХРАНИЛИЩЕ
 # Список 1 (/список):  players, shop, admins
 # Список 2 (/нлист):   nplayers, nshop, nadmins
+# contacts: все, кто писал боту в ЛС (для /рассылка)
 # players: nick_lower -> {
 #   nick, vk_id, points, vacation (строка для показа), otgul,
 #   vac_stage (None | "date" | "incl"),
 #   vac_max (макс. дней), vac_pending (данные покупки до подтверждения),
-#   vac_end (ISO дата окончания), vac_incl (True/False/None)
+#   vac_end (ISO дата окончания), vac_incl (True/False/None),
+#   purchases (история покупок для /откат)
 # }
 # ==========================================================
 lock = threading.RLock()
@@ -68,7 +77,10 @@ save_lock = threading.Lock()
 data = {
     "players": {}, "shop": [], "admins": [],
     "nplayers": {}, "nshop": [], "nadmins": [],
+    "contacts": [],
 }
+CONTACTS = set()
+LAST_BUY = {}
 LIST_TITLE = {1: "/список", 2: "/нлист"}
 def P(n):
     return data["players"] if n == 1 else data["nplayers"]
@@ -181,7 +193,7 @@ def save_data():
             if GIST_ENABLED:
                 return gist_save(payload)
             return True
-DATA_KEYS = ("players", "shop", "admins", "nplayers", "nshop", "nadmins")
+DATA_KEYS = ("players", "shop", "admins", "nplayers", "nshop", "nadmins", "contacts")
 def _has_content(d):
     return bool(d) and any(d.get(key) for key in DATA_KEYS)
 def _read_local():
@@ -200,6 +212,28 @@ def _read_local():
         except Exception:
             pass
         return None
+def _norm_purchases(raw):
+    result = []
+    if isinstance(raw, list):
+        for it in raw:
+            if not isinstance(it, dict):
+                continue
+            try:
+                price = int(it.get("price", 0))
+                num = int(it.get("num", 0))
+            except (TypeError, ValueError):
+                continue
+            kind = it.get("kind")
+            if kind not in ("vacation", "otgul", "other"):
+                kind = "other"
+            result.append({
+                "item": str(it.get("item") or ""),
+                "price": price,
+                "num": num,
+                "kind": kind,
+                "ts": str(it.get("ts") or ""),
+            })
+    return result[-30:]
 def _norm_players(raw_players):
     players = {}
     if isinstance(raw_players, dict):
@@ -249,6 +283,7 @@ def _norm_players(raw_players):
                 "vac_pending": vac_pending,
                 "vac_end": value.get("vac_end"),
                 "vac_incl": vac_incl,
+                "purchases": _norm_purchases(value.get("purchases")),
             }
     return players
 def _norm_shop(raw_shop):
@@ -282,6 +317,7 @@ def _normalize_loaded(loaded):
         "nplayers": _norm_players(loaded.get("nplayers")),
         "nshop": _norm_shop(loaded.get("nshop")),
         "nadmins": _norm_ids(loaded.get("nadmins")),
+        "contacts": list(dict.fromkeys(_norm_ids(loaded.get("contacts")))),
     }
 def load_data():
     local = _read_local()
@@ -321,6 +357,8 @@ def load_data():
     ALLOWED_IDS.update(data["admins"])
     NADMIN_IDS.clear()
     NADMIN_IDS.update(data["nadmins"])
+    CONTACTS.clear()
+    CONTACTS.update(data["contacts"])
     if need_push:
         if not save_data():
             raise SystemExit("Не удалось записать начальные данные в Gist. Бот остановлен.")
@@ -335,6 +373,17 @@ def find_by_id(n, vk_id):
         if p["vk_id"] == vk_id:
             return p
     return None
+def register_contact(user_id):
+    """Запоминает того, кто написал боту в ЛС. True — если это новый пользователь."""
+    if user_id <= 0:
+        return False
+    with lock:
+        if user_id in CONTACTS:
+            return False
+        CONTACTS.add(user_id)
+        data["contacts"].append(user_id)
+        save_data()
+    return True
 # ==========================================================
 # ОТПУСК: даты и актуальность (время по МСК)
 # ==========================================================
@@ -418,18 +467,23 @@ def vacation_active(player):
 # ==========================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
-def reply(peer_id, text):
+def reply(peer_id, text, keyboard=None):
     try:
-        vk.messages.send(peer_id=peer_id, message=str(text), random_id=get_random_id())
+        params = {"peer_id": peer_id, "message": str(text), "random_id": get_random_id()}
+        if keyboard:
+            params["keyboard"] = keyboard
+        vk.messages.send(**params)
     except Exception as e:
         print("Ошибка отправки сообщения:", repr(e))
+def send_to_user(user_id, text):
+    try:
+        vk.messages.send(user_id=user_id, message=text, random_id=get_random_id())
+    except Exception as e:
+        print("Не удалось написать " + str(user_id) + ":", repr(e))
 def notify_admins(text):
     """Уведомление общим админам (покупки из списка 1)."""
     for admin_id in list(ALLOWED_IDS):
-        try:
-            vk.messages.send(user_id=admin_id, message=text, random_id=get_random_id())
-        except Exception as e:
-            print("Не удалось написать " + str(admin_id) + ":", repr(e))
+        send_to_user(admin_id, text)
 def notify_nadmins(text):
     """Уведомление ТОЛЬКО тем, кто получил доступ через /вдв (покупки из /нлист)."""
     ids = list(NADMIN_IDS)
@@ -437,10 +491,7 @@ def notify_nadmins(text):
         print("Покупка в /нлист, но нет ни одного админа с /вдв: " + text)
         return
     for admin_id in ids:
-        try:
-            vk.messages.send(user_id=admin_id, message=text, random_id=get_random_id())
-        except Exception as e:
-            print("Не удалось написать " + str(admin_id) + ":", repr(e))
+        send_to_user(admin_id, text)
 def notify_for_list(n, text):
     if n == 1:
         executor.submit(notify_admins, text)
@@ -469,6 +520,17 @@ def resolve_user(raw):
     except vk_api.ApiError as e:
         print("Ошибка поиска VK:", repr(e))
         return None
+def get_user_name(user_id):
+    try:
+        users = vk.users.get(user_ids=user_id)
+        if users:
+            name = (users[0].get("first_name", "") + " " + users[0].get("last_name", "")).strip()
+            name = re.sub(r"[\[\]|]", "", name)
+            if name:
+                return name
+    except Exception as e:
+        print("Ошибка получения имени:", repr(e))
+    return "пользователя"
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
@@ -506,6 +568,7 @@ def new_player(nick, user_id):
         "vac_pending": None,
         "vac_end": None,
         "vac_incl": None,
+        "purchases": [],
     }
 def cmd_bind(args, n):
     if len(args) != 2:
@@ -567,6 +630,67 @@ def cmd_change(args, n):
         P(n)[new.lower()] = player
         save_data()
         return "Ник изменён: " + old_nick + " -> " + new + "."
+# ==========================================================
+# ОТКАТ последней покупки (/откат или /октат)
+# ==========================================================
+RETURN_WORDS = {"возврат", "возвращ", "возвратить", "вернуть"}
+def cmd_rollback(args, n):
+    usage = "Формат: /откат Nick_Name или @username\n/откат Nick_Name возврат — вернуть и баллы"
+    if not args:
+        return usage
+    target = args[0]
+    rest = [a.lower() for a in args[1:]]
+    refund = any(a in RETURN_WORDS for a in rest)
+    if any(a not in RETURN_WORDS for a in rest):
+        return usage
+
+    with lock:
+        player = find_by_nick(n, target)
+    if player is None:
+        user_id = resolve_user(target)
+        if user_id is None:
+            return "Игрок " + target + " не найден."
+        with lock:
+            player = find_by_id(n, user_id)
+        if player is None:
+            return "Игрок " + target + " не найден (" + LIST_TITLE[n] + ")."
+
+    with lock:
+        purchases = player.get("purchases") or []
+        if not purchases:
+            return "У " + player["nick"] + " нет покупок для отката (" + LIST_TITLE[n] + ")."
+        last = purchases.pop()
+        player["purchases"] = purchases
+        kind = last.get("kind")
+        if kind == "vacation":
+            _clear_vacation(player)
+            player["vac_stage"] = None
+            player["vac_pending"] = None
+        elif kind == "otgul":
+            player["otgul"] = max(0, int(player.get("otgul", 0) or 0) - 1)
+        price = int(last.get("price", 0))
+        if refund:
+            player["points"] += price
+        nick = player["nick"]
+        vk_id = player["vk_id"]
+        points = player["points"]
+        item_name = last.get("item") or "покупка"
+        save_data()
+
+    if refund:
+        user_text = "Ваша покупка «" + item_name + "» отменена администратором. Баллы возвращены: +" + str(price) + "."
+        admin_text = (
+            "Покупка «" + item_name + "» у " + nick + " отменена, баллы возвращены (+" + str(price)
+            + "). Сейчас у него " + str(points) + " баллов."
+        )
+    else:
+        user_text = "Ваша покупка «" + item_name + "» отменена администратором. Баллы не возвращены."
+        admin_text = (
+            "Покупка «" + item_name + "» у " + nick + " отменена, баллы не возвращены. Сейчас у него "
+            + str(points) + " баллов."
+        )
+    executor.submit(send_to_user, vk_id, user_text)
+    return admin_text
 # ==========================================================
 # ВД — полный доступ общего админа
 # ==========================================================
@@ -680,72 +804,58 @@ def cmd_top(n):
     with lock:
         players = list(P(n).values())
     if n == 1:
-        title = "Топ по баллам (/список):"
+        title = "🏆 Топ по баллам (/список):"
     else:
-        title = "Топ по баллам (/нлист):"
+        title = "🏆 Топ по баллам (/нлист):"
     return _format_top(players, title)
 def cmd_top_all():
     """Общий топ по баллам из обоих списков."""
     with lock:
         players = list(P(1).values()) + list(P(2).values())
-    return _format_top(players, "Общий топ по баллам:")
-def handle_top(user_id, suffix, args):
-    """/топ, /топ1, /топ2, /топ общий.
-    Доступ: все, кто привязан хотя бы в одном списке, и админы."""
-    is_common = user_id in ALLOWED_IDS
-    is_nadmin = user_id in NADMIN_IDS
+    return _format_top(players, "🌐 Общий топ по баллам:")
+def top_lists(user_id):
+    """Какие топы доступны пользователю (список номеров 1/2)."""
     with lock:
-        bound1 = find_by_id(1, user_id) is not None
-        bound2 = find_by_id(2, user_id) is not None
-    if not (is_common or is_nadmin or bound1 or bound2):
+        b1 = find_by_id(1, user_id) is not None
+        b2 = find_by_id(2, user_id) is not None
+    if user_id in ALLOWED_IDS:
+        if b1 and not b2:
+            return [1]
+        if b2 and not b1:
+            return [2]
+        return [1, 2]
+    result = set()
+    if user_id in NADMIN_IDS:
+        result.add(2)
+    if b1:
+        result.add(1)
+    if b2:
+        result.add(2)
+    return sorted(result)
+def handle_top(user_id, suffix, args):
+    """Текстовые /топ, /топ1, /топ2, /топ общий (остались для беседы и для тех, кто пишет руками).
+    Доступ: все, кто привязан хотя бы в одном списке, и админы."""
+    lists = top_lists(user_id)
+    if not lists:
         return "Вы не привязаны к нику. Обратитесь к администратору."
-
-    # /топ общий (а также /топобщий)
     if args and args[0].lower() in ("общий", "общ"):
         return cmd_top_all()
     if args:
         return "Формат: /топ или /топ общий"
-
-    # Общий админ: /топ1 -> /список, /топ2 -> /нлист
-    if is_common:
-        if suffix in (1, 2):
+    if suffix in (1, 2):
+        if suffix in lists or user_id in ALLOWED_IDS:
             return cmd_top(suffix)
-        if bound1 and not bound2:
-            return cmd_top(1)
-        if bound2 and not bound1:
-            return cmd_top(2)
-        return (
-            "Укажите, для какого списка:\n"
-            "/топ1 — для /список\n"
-            "/топ2 — для /нлист\n"
-            "/топ общий — общий топ"
-        )
-
-    # Админ /нлист (/вдв): только свой список
-    if is_nadmin and not bound1:
-        if suffix == 1:
-            return "Нет доступа к списку /список."
-        return cmd_top(2)
-
-    # Обычный участник: свой список
-    if suffix == 1 and bound1:
-        return cmd_top(1)
-    if suffix == 2 and bound2:
-        return cmd_top(2)
-    if bound1 and not bound2:
-        return cmd_top(1)
-    if bound2 and not bound1:
-        return cmd_top(2)
-    if bound1 and bound2:
-        return (
-            "Вы состоите в обоих списках. Уточните:\n"
-            "/топ1 — для /список\n"
-            "/топ2 — для /нлист\n"
-            "/топ общий — общий топ"
-        )
-    return cmd_top(2)
+        return "Нет доступа к этому списку."
+    if len(lists) == 1:
+        return cmd_top(lists[0])
+    return (
+        "Укажите, для какого списка:\n"
+        "/топ1 — для /список\n"
+        "/топ2 — для /нлист\n"
+        "/топ общий — общий топ"
+    )
 # ==========================================================
-# РАЗОСЛАТЬ
+# РАЗОСЛАТЬ (по одному списку) и РАССЫЛКА (всем, кто писал боту)
 # ==========================================================
 def cmd_broadcast(raw_text, n):
     parts = raw_text.strip().split(maxsplit=1)
@@ -767,6 +877,73 @@ def cmd_broadcast(raw_text, n):
             print("Рассылка: не удалось отправить " + str(uid) + ":", repr(e))
         time.sleep(0.1)
     return "Рассылка завершена (" + LIST_TITLE[n] + "). Отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
+def cmd_broadcast_all(raw_text):
+    parts = raw_text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return "Формат: /рассылка текст"
+    message = parts[1].strip()
+    with lock:
+        ids = set(CONTACTS)
+        for n in (1, 2):
+            for p in P(n).values():
+                ids.add(p["vk_id"])
+    ids = [i for i in ids if i > 0]
+    if not ids:
+        return "Пока никто не писал боту."
+    sent = 0
+    failed = 0
+    for uid in ids:
+        try:
+            vk.messages.send(user_id=uid, message=message, random_id=get_random_id())
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print("Рассылка: не удалось отправить " + str(uid) + ":", repr(e))
+        time.sleep(0.1)
+    return "Рассылка завершена. Отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
+# ==========================================================
+# /написать — обращение ТОЛЬКО владельцу (OWNER_ID)
+# ==========================================================
+def cmd_write(msg, from_id, text):
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return "Формат: /написать текст"
+    body_text = parts[1].strip()
+    name = get_user_name(from_id)
+    kb = VkKeyboard(inline=True)
+    kb.add_openlink_button("💬 В чат", "https://vk.com/im?sel=" + str(from_id))
+    keyboard = kb.get_keyboard()
+    header = "📩 Сообщение от [id" + str(from_id) + "|" + name + "]"
+    sent = False
+    cmid = msg.get("conversation_message_id")
+    if cmid:
+        try:
+            vk.messages.send(
+                user_id=OWNER_ID,
+                message=header,
+                random_id=get_random_id(),
+                keyboard=keyboard,
+                forward=json.dumps({
+                    "peer_id": msg["peer_id"],
+                    "conversation_message_ids": [cmid],
+                    "is_reply": False,
+                }),
+            )
+            sent = True
+        except Exception as e:
+            print("Не удалось переслать обращение, отправляю текстом:", repr(e))
+    if not sent:
+        try:
+            vk.messages.send(
+                user_id=OWNER_ID,
+                message=header + ":\n\n" + body_text,
+                random_id=get_random_id(),
+                keyboard=keyboard,
+            )
+        except Exception as e:
+            print("Ошибка отправки обращения:", repr(e))
+            return "Не удалось отправить сообщение. Попробуйте позже."
+    return "✅ Ваше сообщение отправлено."
 # ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
@@ -776,23 +953,158 @@ def cmd_points(user_id, n):
         if player is None:
             return "Вы не привязаны к нику. Обратитесь к администратору."
         return player["nick"] + ", у вас " + str(player["points"]) + " баллов."
+def points_text(user_id):
+    with lock:
+        found = [(n, find_by_id(n, user_id)) for n in (1, 2)]
+        found = [(n, p) for n, p in found if p is not None]
+        if not found:
+            return "Вы не привязаны к нику. Обратитесь к администратору."
+        if len(found) == 1:
+            p = found[0][1]
+            return "💰 " + p["nick"] + ", у вас " + str(p["points"]) + " баллов."
+        lines = ["💰 Ваши баллы:"]
+        for n, p in found:
+            lines.append(LIST_TITLE[n] + " — " + p["nick"] + ": " + str(p["points"]))
+        return "\n".join(lines)
 # ==========================================================
-# МАГАЗИН
+# МАГАЗИН (текстовый просмотр)
 # ==========================================================
 def cmd_shop(n):
     with lock:
         shop = list(S(n))
         if not shop:
             return "Магазин пуст."
+        items = sorted(enumerate(shop, 1), key=lambda t: (t[1]["price"], t[0]))
         lines = [
             str(i) + ". " + item["name"] + " — " + str(item["price"]) + " баллов"
-            for i, item in enumerate(shop, 1)
+            for i, item in items
         ]
-        return "Магазин:\n" + "\n".join(lines) + "\n\nКупить: /купить номер"
-def cmd_buy(args, user_id, n):
-    if len(args) != 1 or not re.fullmatch(r"\d+", args[0]):
-        return "Формат: /купить 1"
-    num = int(args[0])
+        return (
+            "Магазин:\n" + "\n".join(lines)
+            + "\n\nКупить можно кнопкой «🛒 Магазин» в меню (если кнопок нет — напишите /меню)."
+        )
+# ==========================================================
+# КНОПКИ: клавиатуры
+# ==========================================================
+START_WORDS = {"начать", "начало", "start", "/start", "/начать", "меню", "/меню", "menu"}
+MENU_TEXT = "Главное меню 👇"
+WELCOME_TEXT = (
+    "Привет! 👋\n"
+    "Все действия теперь доступны кнопками ниже.\n"
+    "Если кнопки пропадут — напишите /меню."
+)
+def btn(kb, label, c, color=VkKeyboardColor.SECONDARY, **extra):
+    payload = {"c": c}
+    payload.update(extra)
+    kb.add_button(label[:40], color=color, payload=payload)
+def menu_keyboard():
+    kb = VkKeyboard(one_time=False)
+    btn(kb, "🛒 Магазин", "shop", VkKeyboardColor.PRIMARY)
+    btn(kb, "💰 Мои баллы", "points", VkKeyboardColor.POSITIVE)
+    kb.add_line()
+    btn(kb, "🏆 Топ", "top")
+    btn(kb, "🌐 Общий топ", "top_all")
+    kb.add_line()
+    btn(kb, "❓ Помощь", "help")
+    return kb.get_keyboard()
+def choice_keyboard(options):
+    """options: список (label, c, extra_dict). Внизу всегда «Назад»."""
+    kb = VkKeyboard(one_time=False)
+    for label, c, extra in options:
+        btn(kb, label, c, VkKeyboardColor.PRIMARY, **extra)
+        kb.add_line()
+    btn(kb, "🔙 Назад", "menu")
+    return kb.get_keyboard()
+def user_lists(user_id):
+    """В каких списках состоит пользователь (для магазина). Если ни в каком — [1]."""
+    with lock:
+        lists = [n for n in (1, 2) if find_by_id(n, user_id) is not None]
+    return lists or [1]
+def _item_label(item):
+    suffix = " — " + str(item["price"])
+    name = item["name"]
+    room = 40 - len(suffix)
+    if len(name) > room:
+        name = name[:room - 1] + "…"
+    return name + suffix
+def shop_view(user_id, n, page=0):
+    """Возвращает (текст, клавиатура) для страницы магазина."""
+    with lock:
+        shop = list(S(n))
+        player = find_by_id(n, user_id)
+    if not shop:
+        return "Магазин пуст.", menu_keyboard()
+    items = sorted(enumerate(shop), key=lambda t: (t[1]["price"], t[0]))
+    pages = max(1, (len(items) + SHOP_PER_PAGE - 1) // SHOP_PER_PAGE)
+    page = max(0, min(page, pages - 1))
+    chunk = items[page * SHOP_PER_PAGE:(page + 1) * SHOP_PER_PAGE]
+
+    kb = VkKeyboard(one_time=False)
+    for idx, item in chunk:
+        btn(kb, _item_label(item), "item", VkKeyboardColor.PRIMARY, l=n, i=idx, pg=page)
+        kb.add_line()
+    nav = False
+    if page > 0:
+        btn(kb, "⬅️", "shop", VkKeyboardColor.SECONDARY, l=n, pg=page - 1)
+        nav = True
+    if page < pages - 1:
+        btn(kb, "➡️", "shop", VkKeyboardColor.SECONDARY, l=n, pg=page + 1)
+        nav = True
+    if nav:
+        kb.add_line()
+    btn(kb, "🔙 Назад", "menu")
+
+    lines = ["🛒 Магазин"]
+    if len([x for x in (1, 2) if find_by_id(x, user_id) is not None]) == 2:
+        lines[0] += " (" + LIST_TITLE[n] + ")"
+    if player is not None:
+        lines.append("У вас: " + str(player["points"]) + " баллов")
+    if pages > 1:
+        lines.append("Страница " + str(page + 1) + " из " + str(pages))
+    lines.append("")
+    lines.append("Выберите товар 👇")
+    return "\n".join(lines), kb.get_keyboard()
+def item_view(user_id, n, idx, pg):
+    """Экран подтверждения покупки."""
+    with lock:
+        player = find_by_id(n, user_id)
+        if player is None:
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
+        if player.get("vac_stage"):
+            return "Сначала завершите оформление отпуска: ответьте на вопрос бота.", menu_keyboard()
+        shop = S(n)
+        if idx < 0 or idx >= len(shop):
+            text, kb = shop_view(user_id, n, 0)
+            return "Товар не найден, магазин обновился.\n\n" + text, kb
+        item = shop[idx]
+        name = item["name"]
+        price = item["price"]
+        points = player["points"]
+    if points < price:
+        text, kb = shop_view(user_id, n, pg)
+        return "❌ Не хватает баллов. Нужно " + str(price) + ", у вас " + str(points) + ".\n\n" + text, kb
+    crc = zlib.crc32(name.encode("utf-8")) & 0xFFFFFFFF
+    text = (
+        "🛍 Подтверждение покупки\n\n"
+        "Товар: " + name + "\n"
+        "Цена: " + str(price) + " баллов\n"
+        "У вас: " + str(points) + " баллов\n"
+        "Останется: " + str(points - price) + "\n\n"
+        "Вы подтверждаете покупку?"
+    )
+    kb = VkKeyboard(one_time=False)
+    btn(kb, "✅ Да, купить", "buy", VkKeyboardColor.POSITIVE, l=n, i=idx, p=price, h=crc)
+    btn(kb, "❌ Отмена", "shop", VkKeyboardColor.NEGATIVE, l=n, pg=pg)
+    return text, kb.get_keyboard()
+# ==========================================================
+# ПОКУПКА (после подтверждения)
+# ==========================================================
+def do_buy(user_id, n, idx, price, crc):
+    now = time.time()
+    key = (user_id, n, idx)
+    last = LAST_BUY.get(key)
+    if last is not None and now - last < 3:
+        return "Покупка уже оформлена."
     with lock:
         player = find_by_id(n, user_id)
         if player is None:
@@ -800,20 +1112,40 @@ def cmd_buy(args, user_id, n):
         if player.get("vac_stage"):
             return "Сначала завершите оформление отпуска: ответьте на вопрос бота."
         shop = S(n)
-        if num < 1 or num > len(shop):
-            return "Товара с таким номером нет."
-        item = shop[num - 1]
-        if player["points"] < item["price"]:
-            return "Не хватает баллов. Нужно " + str(item["price"]) + ", у вас " + str(player["points"]) + "."
+        if idx < 0 or idx >= len(shop):
+            return "Товар не найден. Откройте магазин заново."
+        item = shop[idx]
         item_name = item["name"]
         item_price = item["price"]
+        if item_price != price or (zlib.crc32(item_name.encode("utf-8")) & 0xFFFFFFFF) != crc:
+            return "Товар или его цена изменились. Откройте магазин заново."
+        if player["points"] < item_price:
+            return "Не хватает баллов. Нужно " + str(item_price) + ", у вас " + str(player["points"]) + "."
+        LAST_BUY[key] = now
         name_lower = item_name.lower().strip()
         nick = player["nick"]
+        num = idx + 1
 
         player["points"] -= item_price
         left = player["points"]
 
         if is_vacation_item(item_name):
+            kind = "vacation"
+        elif name_lower == "отгул":
+            kind = "otgul"
+        else:
+            kind = "other"
+        history = player.setdefault("purchases", [])
+        history.append({
+            "item": item_name,
+            "price": item_price,
+            "num": num,
+            "kind": kind,
+            "ts": datetime.now(MSK).isoformat(timespec="seconds"),
+        })
+        player["purchases"] = history[-30:]
+
+        if kind == "vacation":
             # Админам НЕ пишем сейчас: уведомление уйдёт после ответа да/нет
             max_days = vacation_max_days_from_name(item_name)
             player["vac_stage"] = "date"
@@ -821,25 +1153,99 @@ def cmd_buy(args, user_id, n):
             player["vac_pending"] = {"num": num, "item": item_name, "price": item_price}
             save_data()
             return (
-                "Ваш отпуск оплачен! Напишите дату окончания отпуска в формате ДД.ММ "
+                "✅ Ваш отпуск оплачен! Напишите дату окончания отпуска в формате ДД.ММ "
                 "(например 15.12). Максимум до " + str(max_days) + " дн. от сегодняшнего дня (МСК):"
             )
 
-        if name_lower == "отгул":
+        if kind == "otgul":
             player["otgul"] = player.get("otgul", 0) + 1
-            answer = "Вы купили отгул! Осталось баллов: " + str(left) + "."
+            answer = "✅ Вы купили отгул! Осталось баллов: " + str(left) + "."
         else:
-            answer = "Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
+            answer = "✅ Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
 
         save_data()
-        # Уведомление при покупке (кроме отпуска): список 1 -> общим админам,
-        # /нлист -> только тем, кто получил /вдв
         text = (
             "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
             + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
         )
         notify_for_list(n, text)
         return answer
+# ==========================================================
+# ОБРАБОТКА НАЖАТИЙ НА КНОПКИ
+# ==========================================================
+def _int(value, default=0):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+def button_response(user_id, payload):
+    """Возвращает (текст, клавиатура)."""
+    c = payload.get("c")
+
+    if c == "menu":
+        return MENU_TEXT, menu_keyboard()
+
+    if c == "points":
+        return points_text(user_id), menu_keyboard()
+
+    if c == "help":
+        return cmd_help(user_id), menu_keyboard()
+
+    if c == "shop":
+        lists = user_lists(user_id)
+        n = _int(payload.get("l"), 0)
+        if n not in (1, 2):
+            if len(lists) == 2:
+                return "Выберите магазин:", choice_keyboard([
+                    ("🛒 Магазин /список", "shop", {"l": 1}),
+                    ("🛒 Магазин /нлист", "shop", {"l": 2}),
+                ])
+            n = lists[0]
+        return shop_view(user_id, n, _int(payload.get("pg"), 0))
+
+    if c == "item":
+        n = _int(payload.get("l"), 1)
+        if n not in (1, 2):
+            n = 1
+        return item_view(user_id, n, _int(payload.get("i"), -1), _int(payload.get("pg"), 0))
+
+    if c == "buy":
+        n = _int(payload.get("l"), 1)
+        if n not in (1, 2):
+            n = 1
+        answer = do_buy(
+            user_id, n,
+            _int(payload.get("i"), -1),
+            _int(payload.get("p"), -1),
+            _int(payload.get("h"), -1),
+        )
+        return answer, menu_keyboard()
+
+    if c == "top":
+        lists = top_lists(user_id)
+        if not lists:
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
+        if len(lists) == 1:
+            return cmd_top(lists[0]), menu_keyboard()
+        return "Какой топ показать?", choice_keyboard([
+            ("🏆 Топ /список", "top_n", {"l": 1}),
+            ("🏆 Топ /нлист", "top_n", {"l": 2}),
+            ("🌐 Общий топ", "top_all", {}),
+        ])
+
+    if c == "top_n":
+        n = _int(payload.get("l"), 0)
+        lists = top_lists(user_id)
+        if n not in (1, 2) or (n not in lists and user_id not in ALLOWED_IDS):
+            return "Нет доступа к этому списку.", menu_keyboard()
+        return cmd_top(n), menu_keyboard()
+
+    if c == "top_all":
+        if not top_lists(user_id):
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
+        return cmd_top_all(), menu_keyboard()
+
+    return MENU_TEXT, menu_keyboard()
 # ==========================================================
 # ОТПУСК: диалог после покупки (дата -> включительно да/нет)
 # ==========================================================
@@ -901,7 +1307,7 @@ def handle_vacation_reply(player, user_id, n, text):
             + ", " + str(item_price) + " баллов). Выдайте ему."
         )
         notify_for_list(n, notify_text)
-        return "Отпуск зафиксирован до " + date_text + " " + incl_text + "."
+        return "✅ Отпуск зафиксирован до " + date_text + " " + incl_text + "."
 
     return None
 # ==========================================================
@@ -935,22 +1341,20 @@ def cmd_shop_remove(args, n):
 # HELP
 # ==========================================================
 USER_HELP = (
-    "Ваши команды:\n"
-    "/баллы\n"
-    "/топ — топ по баллам\n"
-    "/топ общий — общий топ\n"
-    "/магазин\n"
-    "/купить\n"
+    "Все действия — в кнопках меню. Если кнопок нет, напишите /меню.\n\n"
+    "Кнопки:\n"
+    "🛒 Магазин — товары и покупка\n"
+    "💰 Мои баллы\n"
+    "🏆 Топ — топ по баллам\n"
+    "🌐 Общий топ\n\n"
+    "Команды:\n"
+    "/меню — показать кнопки\n"
     "/help — список команд"
 )
 ADMIN_HELP = (
     "Все команды:\n\n"
-    "Для всех:\n"
-    "/баллы — узнать свои баллы\n"
-    "/топ — топ по баллам своего списка\n"
-    "/топ общий — общий топ из обоих списков\n"
-    "/магазин — список товаров\n"
-    "/купить (номер) — купить товар\n"
+    "Для всех (в ЛС — кнопками, /меню показывает кнопки):\n"
+    "/меню — показать кнопки\n"
     "/help — список команд\n\n"
     "Для администраторов (два независимых списка: /список и /нлист):\n"
     "/список — список участников с баллами\n"
@@ -963,11 +1367,14 @@ ADMIN_HELP = (
     "/+магазин2 100 товар — добавить товар в магазин /нлист\n"
     "/-магазин1 3 и /-магазин2 3 — удалить товар по номеру\n"
     "/разослать1 текст и /разослать2 текст — рассылка по списку\n"
+    "/рассылка текст — рассылка всем, кто писал боту\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
+    "/откат Nick_Name или @username — откатить последнюю покупку (баллы не возвращаются)\n"
+    "/откат Nick_Name возврат — откатить покупку и вернуть баллы\n"
     "/отвязать @username или Nick_Name — отвязать игрока\n"
     "/изменить Старый Новый — сменить ник\n"
-    "(выдать/забрать/отвязать/изменить сами находят список по нику; "
+    "(выдать/забрать/откат/отвязать/изменить сами находят список по нику; "
     "если ник есть в обоих — добавьте 1 или 2: /выдать2 Nick 5)\n"
     "/вд @username — выдать полный доступ админа\n"
     "/снятьвд @username — забрать доступ админа\n"
@@ -979,17 +1386,15 @@ ADMIN_HELP = (
 )
 NADMIN_HELP = (
     "Все команды:\n\n"
-    "Для всех:\n"
-    "/баллы — узнать свои баллы\n"
-    "/топ — топ по баллам\n"
-    "/топ общий — общий топ из обоих списков\n"
-    "/магазин — список товаров\n"
-    "/купить (номер) — купить товар\n"
+    "Для всех (в ЛС — кнопками, /меню показывает кнопки):\n"
+    "/меню — показать кнопки\n"
     "/help — список команд\n\n"
     "Для администратора /нлист:\n"
     "/нлист — список участников с баллами\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
+    "/откат Nick_Name или @username — откатить последнюю покупку (баллы не возвращаются)\n"
+    "/откат Nick_Name возврат — откатить покупку и вернуть баллы\n"
     "/привязать @username Nick_Name — привязать игрока\n"
     "/отвязать @username или Nick_Name — отвязать игрока\n"
     "/изменить Старый Новый — сменить ник\n"
@@ -1008,7 +1413,7 @@ def cmd_help(user_id):
 # ==========================================================
 LIST_COMMANDS = {
     "/выдать", "/забрать", "/привязать", "/отвязать", "/убрать",
-    "/изменить", "/+магазин", "/-магазин", "/разослать",
+    "/изменить", "/+магазин", "/-магазин", "/разослать", "/откат",
     "/баллы", "/магазин", "/купить", "/топ",
 }
 # Эти команды общий админ ОБЯЗАН вводить с номером списка
@@ -1032,7 +1437,7 @@ def auto_ctx(command, args):
     target = args[0]
     with lock:
         found = [n for n in (1, 2) if find_by_nick(n, target) is not None]
-    if not found and command in ("/отвязать", "/убрать"):
+    if not found and command in ("/отвязать", "/убрать", "/откат"):
         user_id = resolve_user(target)
         if user_id is not None:
             with lock:
@@ -1054,6 +1459,9 @@ def handle(text, user_id):
     if not parts:
         return None
     raw_cmd = parts[0].lower()
+    # опечатка /октат = /откат
+    if raw_cmd.startswith("/октат"):
+        raw_cmd = "/откат" + raw_cmd[len("/октат"):]
     args = parts[1:]
     is_common = user_id in ALLOWED_IDS
     is_nadmin = user_id in NADMIN_IDS
@@ -1073,6 +1481,10 @@ def handle(text, user_id):
         return cmd_grant_nadmin(args) if is_common else None
     if raw_cmd == "/снятьвдв":
         return cmd_revoke_nadmin(args) if is_common else None
+
+    # Рассылка всем, кто писал боту — только общие админы
+    if raw_cmd == "/рассылка":
+        return cmd_broadcast_all(text) if is_common else None
 
     command, suffix = split_command(raw_cmd)
     if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
@@ -1102,6 +1514,8 @@ def handle(text, user_id):
         return cmd_bind(args, n)
     if command in ("/отвязать", "/убрать"):
         return cmd_unbind(args, n)
+    if command == "/откат":
+        return cmd_rollback(args, n)
     if command == "/изменить":
         return cmd_change(args, n)
     if command == "/+магазин":
@@ -1126,17 +1540,52 @@ def public_ctx(user_id, suffix):
 # ==========================================================
 # ОБРАБОТКА СОБЫТИЯ VK
 # ==========================================================
+def parse_payload(msg):
+    raw = msg.get("payload")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 def process_event(event):
     if event.type != VkBotEventType.MESSAGE_NEW:
         return
     msg = event.obj.message
-    text = msg.get("text", "").strip()
+    text = (msg.get("text") or "").strip()
     peer_id = msg["peer_id"]
     from_id = msg["from_id"]
+    is_dm = (peer_id == from_id and from_id > 0)
+    payload = parse_payload(msg)
     if DEBUG:
-        print("Сообщение от " + str(from_id) + ": " + repr(text))
+        print("Сообщение от " + str(from_id) + ": " + repr(text) + " payload=" + repr(payload))
+
+    # Запоминаем всех, кто пишет боту в ЛС (для /рассылка)
+    is_new = register_contact(from_id) if is_dm else False
+
+    # === Нажатия на кнопки (только ЛС) ===
+    if is_dm and payload:
+        if payload.get("command") == "start":
+            reply(peer_id, WELCOME_TEXT, menu_keyboard())
+            return
+        if payload.get("c"):
+            try:
+                answer, kb = button_response(from_id, payload)
+            except Exception as e:
+                print("Ошибка кнопки:", repr(e))
+                answer, kb = "Произошла ошибка. Попробуйте позже.", menu_keyboard()
+            reply(peer_id, answer, kb)
+            return
+
+    # === «Начать» / /меню ===
+    if is_dm and text.lower() in START_WORDS:
+        reply(peer_id, WELCOME_TEXT if is_new else MENU_TEXT, menu_keyboard())
+        return
+
     # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
+        handled = False
         with lock:
             for n in (1, 2):
                 player = find_by_id(n, from_id)
@@ -1144,8 +1593,17 @@ def process_event(event):
                     answer = handle_vacation_reply(player, from_id, n, text)
                     if answer:
                         reply(peer_id, answer)
+                    handled = True
                     break
+        # новый пользователь написал что угодно — сразу показываем кнопки
+        if is_dm and is_new and not handled:
+            reply(peer_id, WELCOME_TEXT, menu_keyboard())
         return
+
+    # новый пользователь начал с команды — тоже показываем кнопки
+    if is_dm and is_new:
+        reply(peer_id, WELCOME_TEXT, menu_keyboard())
+
     # ======================================================
     # ПУБЛИЧНЫЕ КОМАНДЫ (доступны всем)
     # ======================================================
@@ -1164,13 +1622,15 @@ def process_event(event):
         elif command == "/магазин":
             public_answer = cmd_shop(public_ctx(from_id, suffix))
         elif command == "/купить":
-            public_answer = cmd_buy(args, from_id, public_ctx(from_id, suffix))
+            public_answer = "Покупки теперь через кнопки: нажмите «🛒 Магазин» в меню (если кнопок нет — напишите /меню)."
         elif raw_cmd in ("/топобщий", "/топ_общий"):
             public_answer = handle_top(from_id, None, ["общий"])
         elif command == "/топ":
             public_answer = handle_top(from_id, suffix, args)
         elif raw_cmd == "/я":
             public_answer = "Ваш VK ID: " + str(from_id)
+        elif raw_cmd == "/написать":
+            public_answer = cmd_write(msg, from_id, text)
         else:
             is_public = False
     except Exception as e:
@@ -1220,7 +1680,9 @@ def main():
         "Список 1: игроков " + str(len(data["players"])) + ", товаров " + str(len(data["shop"]))
         + " | /нлист: игроков " + str(len(data["nplayers"])) + ", товаров " + str(len(data["nshop"]))
         + " | общих админов: " + str(len(ALLOWED_IDS)) + ", админов /нлист: " + str(len(NADMIN_IDS))
+        + " | контактов: " + str(len(CONTACTS))
     )
+    print("Владелец обращений (/написать):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
     while True:
         try:
