@@ -635,7 +635,7 @@ def cmd_change(args, n):
 # ==========================================================
 RETURN_WORDS = {"возврат", "возвращ", "возвратить", "вернуть"}
 def cmd_rollback(args, n):
-    usage = "Формат: /откат Nick_Name или @username\n/откат Nick_Name возврат — вернуть и баллы"
+    usage = "Формат: /откат Nick_Name или @username\n/откат Nick_Name вернуть — вернуть баллы"
     if not args:
         return usage
     target = args[0]
