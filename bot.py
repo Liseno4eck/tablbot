@@ -41,6 +41,8 @@ DEFAULT_VACATION_MAX_DAYS = 4
 TOP_LIMIT = 10
 # Сколько товаров на одной странице кнопок магазина
 SHOP_PER_PAGE = 6
+# Сколько последних покупок хранить у каждого игрока (для /откат по номеру)
+PURCHASE_HISTORY_LIMIT = 200
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -64,12 +66,13 @@ executor = ThreadPoolExecutor(max_workers=8)
 # Список 1 (/список):  players, shop, admins
 # Список 2 (/нлист):   nplayers, nshop, nadmins
 # contacts: все, кто писал боту в ЛС (для /рассылка)
+# purchase_counter: сквозной счётчик номеров покупок (общий для обоих списков)
 # players: nick_lower -> {
 #   nick, vk_id, points, vacation (строка для показа), otgul,
 #   vac_stage (None | "date" | "incl"),
 #   vac_max (макс. дней), vac_pending (данные покупки до подтверждения),
 #   vac_end (ISO дата окончания), vac_incl (True/False/None),
-#   purchases (история покупок для /откат)
+#   purchases (история покупок для /откат, у каждой есть "id" — номер покупки)
 # }
 # ==========================================================
 lock = threading.RLock()
@@ -78,6 +81,7 @@ data = {
     "players": {}, "shop": [], "admins": [],
     "nplayers": {}, "nshop": [], "nadmins": [],
     "contacts": [],
+    "purchase_counter": 0,
 }
 CONTACTS = set()
 LAST_BUY = {}
@@ -223,17 +227,22 @@ def _norm_purchases(raw):
                 num = int(it.get("num", 0))
             except (TypeError, ValueError):
                 continue
+            try:
+                pid = int(it.get("id", 0) or 0)
+            except (TypeError, ValueError):
+                pid = 0
             kind = it.get("kind")
             if kind not in ("vacation", "otgul", "other"):
                 kind = "other"
             result.append({
+                "id": pid,
                 "item": str(it.get("item") or ""),
                 "price": price,
                 "num": num,
                 "kind": kind,
                 "ts": str(it.get("ts") or ""),
             })
-    return result[-30:]
+    return result[-PURCHASE_HISTORY_LIMIT:]
 def _norm_players(raw_players):
     players = {}
     if isinstance(raw_players, dict):
@@ -309,15 +318,38 @@ def _norm_ids(raw_ids):
             except (TypeError, ValueError):
                 pass
     return ids
+def _assign_purchase_ids(players1, players2, counter):
+    """Старым покупкам без номера выдаёт номера (по времени). Возвращает новый счётчик."""
+    all_purchases = []
+    for players in (players1, players2):
+        for p in players.values():
+            for pur in p.get("purchases", []):
+                if pur.get("id", 0) > counter:
+                    counter = pur["id"]
+                all_purchases.append(pur)
+    legacy = [pur for pur in all_purchases if pur.get("id", 0) <= 0]
+    legacy.sort(key=lambda pur: pur.get("ts") or "")
+    for pur in legacy:
+        counter += 1
+        pur["id"] = counter
+    return counter
 def _normalize_loaded(loaded):
+    players1 = _norm_players(loaded.get("players"))
+    players2 = _norm_players(loaded.get("nplayers"))
+    try:
+        counter = int(loaded.get("purchase_counter", 0) or 0)
+    except (TypeError, ValueError):
+        counter = 0
+    counter = _assign_purchase_ids(players1, players2, max(0, counter))
     return {
-        "players": _norm_players(loaded.get("players")),
+        "players": players1,
         "shop": _norm_shop(loaded.get("shop")),
         "admins": _norm_ids(loaded.get("admins")),
-        "nplayers": _norm_players(loaded.get("nplayers")),
+        "nplayers": players2,
         "nshop": _norm_shop(loaded.get("nshop")),
         "nadmins": _norm_ids(loaded.get("nadmins")),
         "contacts": list(dict.fromkeys(_norm_ids(loaded.get("contacts")))),
+        "purchase_counter": counter,
     }
 def load_data():
     local = _read_local()
@@ -352,6 +384,7 @@ def load_data():
     normalized = _normalize_loaded(loaded)
     for key in DATA_KEYS:
         data[key] = normalized[key]
+    data["purchase_counter"] = normalized["purchase_counter"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -497,6 +530,17 @@ def notify_for_list(n, text):
         executor.submit(notify_admins, text)
     else:
         executor.submit(notify_nadmins, "[/нлист] " + text)
+def _notify_rollback_worker(n, text, exclude_id):
+    ids = set(ALLOWED_IDS)
+    if n == 2:
+        ids |= set(NADMIN_IDS)
+    ids.discard(exclude_id)
+    for admin_id in ids:
+        send_to_user(admin_id, text)
+def notify_rollback(n, text, exclude_id):
+    """Сообщение об откате всем админам (кроме того, кто откатил).
+    Для покупок из /нлист — ещё и админам /вдв."""
+    executor.submit(_notify_rollback_worker, n, text, exclude_id)
 # ==========================================================
 # ОПРЕДЕЛЕНИЕ VK ID
 # ==========================================================
@@ -631,41 +675,62 @@ def cmd_change(args, n):
         save_data()
         return "Ник изменён: " + old_nick + " -> " + new + "."
 # ==========================================================
-# ОТКАТ последней покупки (/откат или /октат)
+# ОТКАТ покупки ПО НОМЕРУ (/откат 5 или /откат 5 вернуть)
 # ==========================================================
 RETURN_WORDS = {"возврат", "возвращ", "возвратить", "вернуть"}
-def cmd_rollback(args, n):
-    usage = "Формат: /откат Nick_Name или @username\n/откат Nick_Name вернуть — вернуть баллы"
-    if not args:
+def cmd_rollback(args, admin_id, is_common):
+    """Откатывает покупку по её номеру. Общий админ — любую, админ /вдв — только из /нлист."""
+    usage = (
+        "Формат: /откат НОМЕР_ПОКУПКИ\n"
+        "/откат НОМЕР_ПОКУПКИ вернуть — откатить и вернуть баллы\n"
+        "Например: /откат 2 вернуть"
+    )
+    if not args or not re.fullmatch(r"\d+", args[0]):
         return usage
-    target = args[0]
+    pid = int(args[0])
+    if pid <= 0:
+        return usage
     rest = [a.lower() for a in args[1:]]
     refund = any(a in RETURN_WORDS for a in rest)
     if any(a not in RETURN_WORDS for a in rest):
         return usage
 
-    with lock:
-        player = find_by_nick(n, target)
-    if player is None:
-        user_id = resolve_user(target)
-        if user_id is None:
-            return "Игрок " + target + " не найден."
-        with lock:
-            player = find_by_id(n, user_id)
-        if player is None:
-            return "Игрок " + target + " не найден (" + LIST_TITLE[n] + ")."
+    admin_name = get_user_name(admin_id)
+    lists = (1, 2) if is_common else (2,)
 
     with lock:
+        player = None
+        found_n = None
+        last = None
+        for n in lists:
+            for p in P(n).values():
+                for pur in (p.get("purchases") or []):
+                    if pur.get("id") == pid:
+                        player = p
+                        found_n = n
+                        last = pur
+                        break
+                if last is not None:
+                    break
+            if last is not None:
+                break
+        if last is None:
+            return "Покупка №" + str(pid) + " не найдена (возможно, она уже откачена)."
+
         purchases = player.get("purchases") or []
-        if not purchases:
-            return "У " + player["nick"] + " нет покупок для отката (" + LIST_TITLE[n] + ")."
-        last = purchases.pop()
+        purchases.remove(last)
         player["purchases"] = purchases
         kind = last.get("kind")
         if kind == "vacation":
-            _clear_vacation(player)
-            player["vac_stage"] = None
-            player["vac_pending"] = None
+            # сбрасываем отпуск только если это самая свежая покупка отпуска
+            later = any(
+                x.get("kind") == "vacation" and x.get("id", 0) > pid
+                for x in purchases
+            )
+            if not later:
+                _clear_vacation(player)
+                player["vac_stage"] = None
+                player["vac_pending"] = None
         elif kind == "otgul":
             player["otgul"] = max(0, int(player.get("otgul", 0) or 0) - 1)
         price = int(last.get("price", 0))
@@ -678,18 +743,25 @@ def cmd_rollback(args, n):
         save_data()
 
     if refund:
-        user_text = "Ваша покупка «" + item_name + "» отменена администратором. Баллы возвращены: +" + str(price) + "."
-        admin_text = (
-            "Покупка «" + item_name + "» у " + nick + " отменена, баллы возвращены (+" + str(price)
-            + "). Сейчас у него " + str(points) + " баллов."
+        user_text = (
+            "Ваша покупка №" + str(pid) + " «" + item_name + "» отменена администратором. "
+            "Баллы возвращены: +" + str(price) + "."
         )
+        result_text = "баллы возвращены (+" + str(price) + ")"
     else:
-        user_text = "Ваша покупка «" + item_name + "» отменена администратором. Баллы не возвращены."
-        admin_text = (
-            "Покупка «" + item_name + "» у " + nick + " отменена, баллы не возвращены. Сейчас у него "
-            + str(points) + " баллов."
-        )
+        user_text = "Ваша покупка №" + str(pid) + " «" + item_name + "» отменена администратором. Баллы не возвращены."
+        result_text = "баллы не возвращены"
+
+    admin_text = (
+        "Покупка №" + str(pid) + " «" + item_name + "» у " + nick + " (" + LIST_TITLE[found_n] + ") откачена, "
+        + result_text + ". Сейчас у него " + str(points) + " баллов."
+    )
+    all_admins_text = (
+        "↩️ Админ [id" + str(admin_id) + "|" + admin_name + "] откатил покупку №" + str(pid)
+        + " «" + item_name + "» у " + nick + " (" + LIST_TITLE[found_n] + "), " + result_text + "."
+    )
     executor.submit(send_to_user, vk_id, user_text)
+    notify_rollback(found_n, all_admins_text, admin_id)
     return admin_text
 # ==========================================================
 # ВД — полный доступ общего админа
@@ -1126,6 +1198,10 @@ def do_buy(user_id, n, idx, price, crc):
         nick = player["nick"]
         num = idx + 1
 
+        # сквозной номер покупки
+        purchase_id = int(data.get("purchase_counter", 0) or 0) + 1
+        data["purchase_counter"] = purchase_id
+
         player["points"] -= item_price
         left = player["points"]
 
@@ -1137,35 +1213,37 @@ def do_buy(user_id, n, idx, price, crc):
             kind = "other"
         history = player.setdefault("purchases", [])
         history.append({
+            "id": purchase_id,
             "item": item_name,
             "price": item_price,
             "num": num,
             "kind": kind,
             "ts": datetime.now(MSK).isoformat(timespec="seconds"),
         })
-        player["purchases"] = history[-30:]
+        player["purchases"] = history[-PURCHASE_HISTORY_LIMIT:]
 
         if kind == "vacation":
             # Админам НЕ пишем сейчас: уведомление уйдёт после ответа да/нет
             max_days = vacation_max_days_from_name(item_name)
             player["vac_stage"] = "date"
             player["vac_max"] = max_days
-            player["vac_pending"] = {"num": num, "item": item_name, "price": item_price}
+            player["vac_pending"] = {"num": num, "item": item_name, "price": item_price, "pid": purchase_id}
             save_data()
             return (
-                "✅ Ваш отпуск оплачен! Напишите дату окончания отпуска в формате ДД.ММ "
+                "✅ Ваш отпуск оплачен! (покупка №" + str(purchase_id) + ")\n"
+                "Напишите дату окончания отпуска в формате ДД.ММ "
                 "(например 15.12). Максимум до " + str(max_days) + " дн. от сегодняшнего дня (МСК):"
             )
 
         if kind == "otgul":
             player["otgul"] = player.get("otgul", 0) + 1
-            answer = "✅ Вы купили отгул! Осталось баллов: " + str(left) + "."
+            answer = "✅ Вы купили отгул! (покупка №" + str(purchase_id) + ") Осталось баллов: " + str(left) + "."
         else:
-            answer = "✅ Вы купили: " + item_name + ". Осталось баллов: " + str(left) + "."
+            answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + "."
 
         save_data()
         text = (
-            "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
+            "Покупка №" + str(purchase_id) + ": [id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
             + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
         )
         notify_for_list(n, text)
@@ -1301,8 +1379,10 @@ def handle_vacation_reply(player, user_id, n, text):
         item_name = pending.get("item") or "отпуск"
         item_price = pending.get("price", 0)
         num = pending.get("num", 0)
+        pid = pending.get("pid")
+        prefix = ("Покупка №" + str(pid) + ": ") if pid else ""
         notify_text = (
-            "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил отпуск до "
+            prefix + "[id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил отпуск до "
             + date_text + " " + incl_text + " (№" + str(num) + ": " + item_name
             + ", " + str(item_price) + " баллов). Выдайте ему."
         )
@@ -1370,11 +1450,12 @@ ADMIN_HELP = (
     "/рассылка текст — рассылка всем, кто писал боту\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
-    "/откат Nick_Name или @username — откатить последнюю покупку (баллы не возвращаются)\n"
-    "/откат Nick_Name возврат — откатить покупку и вернуть баллы\n"
+    "/откат НОМЕР — откатить покупку по её номеру (баллы не возвращаются)\n"
+    "/откат НОМЕР вернуть — откатить покупку и вернуть баллы (например /откат 2 вернуть)\n"
+    "(номер покупки указан в уведомлении «Покупка №N»; об откате все админы получают сообщение)\n"
     "/отвязать @username или Nick_Name — отвязать игрока\n"
     "/изменить Старый Новый — сменить ник\n"
-    "(выдать/забрать/откат/отвязать/изменить сами находят список по нику; "
+    "(выдать/забрать/отвязать/изменить сами находят список по нику; "
     "если ник есть в обоих — добавьте 1 или 2: /выдать2 Nick 5)\n"
     "/вд @username — выдать полный доступ админа\n"
     "/снятьвд @username — забрать доступ админа\n"
@@ -1393,8 +1474,8 @@ NADMIN_HELP = (
     "/нлист — список участников с баллами\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
-    "/откат Nick_Name или @username — откатить последнюю покупку (баллы не возвращаются)\n"
-    "/откат Nick_Name возврат — откатить покупку и вернуть баллы\n"
+    "/откат НОМЕР — откатить покупку по её номеру (баллы не возвращаются)\n"
+    "/откат НОМЕР вернуть — откатить покупку и вернуть баллы (например /откат 2 вернуть)\n"
     "/привязать @username Nick_Name — привязать игрока\n"
     "/отвязать @username или Nick_Name — отвязать игрока\n"
     "/изменить Старый Новый — сменить ник\n"
@@ -1437,7 +1518,7 @@ def auto_ctx(command, args):
     target = args[0]
     with lock:
         found = [n for n in (1, 2) if find_by_nick(n, target) is not None]
-    if not found and command in ("/отвязать", "/убрать", "/откат"):
+    if not found and command in ("/отвязать", "/убрать"):
         user_id = resolve_user(target)
         if user_id is not None:
             with lock:
@@ -1490,6 +1571,12 @@ def handle(text, user_id):
     if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
         return None
 
+    # Откат по номеру покупки (список определяется по самой покупке)
+    if command == "/откат":
+        if not is_common and not is_nadmin:
+            return None
+        return cmd_rollback(args, user_id, is_common)
+
     # Определяем, с каким списком работаем
     if is_common:
         n = suffix
@@ -1514,8 +1601,6 @@ def handle(text, user_id):
         return cmd_bind(args, n)
     if command in ("/отвязать", "/убрать"):
         return cmd_unbind(args, n)
-    if command == "/откат":
-        return cmd_rollback(args, n)
     if command == "/изменить":
         return cmd_change(args, n)
     if command == "/+магазин":
@@ -1681,6 +1766,7 @@ def main():
         + " | /нлист: игроков " + str(len(data["nplayers"])) + ", товаров " + str(len(data["nshop"]))
         + " | общих админов: " + str(len(ALLOWED_IDS)) + ", админов /нлист: " + str(len(NADMIN_IDS))
         + " | контактов: " + str(len(CONTACTS))
+        + " | покупок всего: " + str(data.get("purchase_counter", 0))
     )
     print("Владелец обращений (/написать):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
