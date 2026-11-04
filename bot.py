@@ -35,7 +35,7 @@ ALLOWED_IDS = {
 BASE_ADMIN_IDS = set(ALLOWED_IDS)
 # Админы второго списка (/нлист): выдаются командой /вдв
 NADMIN_IDS = set()
-# Владелец: ТОЛЬКО ему приходят обращения из /написать.
+# Владелец: ТОЛЬКО ему приходят обращения из /написать и только он может отвечать через /ответить.
 # Поменяйте на свой VK ID (или задайте переменную окружения OWNER_ID)
 OWNER_ID = int(os.environ.get("OWNER_ID", "875762552"))
 DATA_FILE = os.environ.get("DATA_FILE", "data.json")
@@ -1028,6 +1028,47 @@ def cmd_write(msg, from_id, text):
             return "Не удалось отправить сообщение. Попробуйте позже."
     return "✅ Ваше сообщение отправлено."
 # ==========================================================
+# /ответить — ответ владельца на обращение (/написать)
+# Использование: ответить (reply) на сообщение бота «📩 Сообщение от ...»
+# и написать /ответить текст. Пользователь получит:
+# «Ответ от администратора: текст»
+# ==========================================================
+def cmd_reply_to_user(msg, from_id, text):
+    if from_id != OWNER_ID:
+        return None
+    parts = text.strip().split(maxsplit=1)
+    if len(parts) < 2 or not parts[1].strip():
+        return "Формат: ответьте на сообщение бота командой /ответить текст"
+    answer_text = parts[1].strip()
+
+    replied = msg.get("reply_message")
+    if not replied:
+        return "Ответьте (reply) на сообщение бота с обращением и напишите /ответить текст"
+    if replied.get("from_id") != -GROUP_ID:
+        return "Нужно отвечать именно на сообщение от бота с обращением."
+
+    target_id = None
+    match = re.search(r"\[id(\d+)\|", replied.get("text") or "")
+    if match:
+        target_id = int(match.group(1))
+    if target_id is None:
+        fwd = replied.get("fwd_messages") or []
+        if fwd and isinstance(fwd[0], dict) and fwd[0].get("from_id", 0) > 0:
+            target_id = fwd[0]["from_id"]
+    if target_id is None:
+        return "Не удалось определить автора обращения. Отвечайте на сообщение «📩 Сообщение от ...»."
+
+    try:
+        vk.messages.send(
+            user_id=target_id,
+            message="Ответ от администратора: " + answer_text,
+            random_id=get_random_id(),
+        )
+    except Exception as e:
+        print("Не удалось отправить ответ:", repr(e))
+        return "❌ Не удалось отправить ответ пользователю."
+    return "✅ Ответ отправлен [id" + str(target_id) + "|пользователю]."
+# ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
 def cmd_points(user_id, n):
@@ -1459,6 +1500,7 @@ ADMIN_HELP = (
     "/-магазин1 3 и /-магазин2 3 — удалить товар по номеру\n"
     "/разослать1 текст и /разослать2 текст — рассылка по списку\n"
     "/рассылка текст — рассылка всем, кто писал боту\n"
+    "/ответить текст — (владелец) ответом на обращение из /написать отправить ответ пользователю\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
     "/откат НОМЕР — откатить покупку по её номеру (баллы не возвращаются)\n"
@@ -1528,6 +1570,7 @@ ADMIN_SECTIONS = [
     ("Рассылки", [
         ("/разослать1|2 текст", "Всем игрокам списка"),
         ("/рассылка текст", "Всем, кто писал боту"),
+        ("/ответить текст", "Ответ на обращение (reply)"),
     ]),
     ("Доступ", [
         ("/вд @юз", "Полный доступ админа"),
@@ -2055,6 +2098,8 @@ def process_event(event):
             public_answer = "Ваш VK ID: " + str(from_id)
         elif raw_cmd == "/написать":
             public_answer = cmd_write(msg, from_id, text)
+        elif raw_cmd in ("/ответить", "/ответ"):
+            public_answer = cmd_reply_to_user(msg, from_id, text)
         else:
             is_public = False
     except Exception as e:
