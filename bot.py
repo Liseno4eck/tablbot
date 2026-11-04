@@ -6,12 +6,19 @@ import zlib
 import threading
 import urllib.request
 import urllib.error
+from io import BytesIO
 from datetime import datetime, timedelta, timezone, date
 import vk_api
 from concurrent.futures import ThreadPoolExecutor
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
+
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    PIL_OK = True
+except Exception:
+    PIL_OK = False
 # ==========================================================
 # НАСТРОЙКИ
 # ==========================================================
@@ -43,6 +50,8 @@ TOP_LIMIT = 10
 SHOP_PER_PAGE = 6
 # Сколько последних покупок хранить у каждого игрока (для /откат по номеру)
 PURCHASE_HISTORY_LIMIT = 200
+# Папка для шрифтов (для картинки-справки)
+FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -500,11 +509,13 @@ def vacation_active(player):
 # ==========================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
-def reply(peer_id, text, keyboard=None):
+def reply(peer_id, text, keyboard=None, attachment=None):
     try:
         params = {"peer_id": peer_id, "message": str(text), "random_id": get_random_id()}
         if keyboard:
             params["keyboard"] = keyboard
+        if attachment:
+            params["attachment"] = attachment
         vk.messages.send(**params)
     except Exception as e:
         print("Ошибка отправки сообщения:", repr(e))
@@ -1418,7 +1429,7 @@ def cmd_shop_remove(args, n):
         save_data()
         return "Товар удалён (" + LIST_TITLE[n] + "): " + item_name + "."
 # ==========================================================
-# HELP
+# HELP (текстовые версии — запасной вариант, если картинка не создалась)
 # ==========================================================
 USER_HELP = (
     "Все действия — в кнопках меню. Если кнопок нет, напишите /меню.\n\n"
@@ -1489,6 +1500,326 @@ def cmd_help(user_id):
     if user_id in NADMIN_IDS:
         return NADMIN_HELP
     return USER_HELP
+# ==========================================================
+# КАРТИНКА-СПРАВКА ДЛЯ АДМИНОВ (рисуется самим ботом через Pillow)
+# ==========================================================
+# Разделы: (название, [(команда, короткое описание), ...])
+ADMIN_SECTIONS = [
+    ("Участники и баллы", [
+        ("/список", "Участники и баллы (список 1)"),
+        ("/нлист", "Участники второго списка"),
+        ("/топ1  ·  /топ2", "Топ по баллам каждого списка"),
+        ("/выдать Ник 5", "Выдать баллы"),
+        ("/забрать Ник 5", "Забрать баллы"),
+    ]),
+    ("Игроки", [
+        ("/привязать1|2 @юз Ник", "Привязать игрока к нику"),
+        ("/отвязать @юз  или  Ник", "Отвязать игрока"),
+        ("/изменить Старый Новый", "Сменить ник"),
+    ]),
+    ("Магазин", [
+        ("/+магазин1|2 100 товар", "Добавить товар"),
+        ("/-магазин1|2 3", "Удалить товар по номеру"),
+    ]),
+    ("Покупки", [
+        ("/откат 5", "Откатить покупку №5"),
+        ("/откат 5 вернуть", "Откатить и вернуть баллы"),
+    ]),
+    ("Рассылки", [
+        ("/разослать1|2 текст", "Всем игрокам списка"),
+        ("/рассылка текст", "Всем, кто писал боту"),
+    ]),
+    ("Доступ", [
+        ("/вд @юз", "Полный доступ админа"),
+        ("/снятьвд @юз", "Забрать полный доступ"),
+        ("/вдв @юз", "Доступ только к /нлист"),
+        ("/снятьвдв @юз", "Забрать доступ к /нлист"),
+    ]),
+    ("Для всех", [
+        ("/меню", "Показать кнопки"),
+        ("/help", "Эта справка"),
+    ]),
+]
+NADMIN_SECTIONS = [
+    ("Участники и баллы", [
+        ("/нлист", "Список участников"),
+        ("/выдать Ник 5", "Выдать баллы"),
+        ("/забрать Ник 5", "Забрать баллы"),
+    ]),
+    ("Игроки", [
+        ("/привязать @юз Ник", "Привязать игрока к нику"),
+        ("/отвязать @юз  или  Ник", "Отвязать игрока"),
+        ("/изменить Старый Новый", "Сменить ник"),
+    ]),
+    ("Магазин", [
+        ("/+магазин 100 товар", "Добавить товар"),
+        ("/-магазин 3", "Удалить товар по номеру"),
+    ]),
+    ("Покупки", [
+        ("/откат 5", "Откатить покупку №5"),
+        ("/откат 5 вернуть", "Откатить и вернуть баллы"),
+    ]),
+    ("Рассылка", [
+        ("/разослать текст", "Всем игрокам /нлист"),
+    ]),
+    ("Для всех", [
+        ("/меню", "Показать кнопки"),
+        ("/help", "Эта справка"),
+    ]),
+]
+ADMIN_CAPTION = (
+    "📖 Пояснения к командам\n\n"
+    "• Ник — игровой ник, как в /список. @юз — @username, ссылка vk.com/... или упоминание.\n\n"
+    "• Цифра 1 или 2 в конце команды — номер списка: 1 = /список, 2 = /нлист.\n"
+    "Команды /привязать, /+магазин, /-магазин, /разослать пишутся только с цифрой, например: /привязать2 @юз Nick.\n\n"
+    "• /выдать, /забрать, /отвязать, /изменить сами находят список по нику. "
+    "Если такой ник есть в обоих списках — добавьте цифру: /выдать2 Nick 5.\n\n"
+    "• /откат 5 — номер покупки берите из уведомления «Покупка №N». "
+    "Без слова «вернуть» баллы остаются у магазина, со словом «вернуть» — возвращаются игроку. "
+    "Игрок и остальные админы получат сообщение об откате.\n\n"
+    "• /вд — полный доступ ко всем спискам. /вдв — доступ только к /нлист "
+    "(такой админ получает уведомления только о покупках из /нлист).\n\n"
+    "• Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин1|2. "
+    "После покупки бот спросит дату и «включительно да/нет», потом уведомит админов. Время — по МСК.\n\n"
+    "• /рассылка — всем, кто хоть раз писал боту; /разослать — только привязанным игрокам выбранного списка."
+)
+NADMIN_CAPTION = (
+    "📖 Пояснения к командам\n\n"
+    "• Ник — игровой ник, как в /нлист. @юз — @username, ссылка vk.com/... или упоминание.\n\n"
+    "• Все команды работают только со списком /нлист — цифры 1 или 2 писать не нужно.\n\n"
+    "• /откат 5 — номер покупки берите из уведомления «Покупка №N». "
+    "Без слова «вернуть» баллы не возвращаются, со словом «вернуть» — возвращаются игроку. "
+    "Откатить можно только покупки из /нлист.\n\n"
+    "• Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин. "
+    "После покупки бот спросит дату и «включительно да/нет», потом уведомит вас. Время — по МСК.\n\n"
+    "• /разослать — сообщение всем привязанным игрокам /нлист."
+)
+# ---------- шрифты ----------
+_FONT_PATHS = {
+    False: [
+        os.path.join(FONT_DIR, "font.ttf"),
+        os.path.join(FONT_DIR, "DejaVuSans.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Regular.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSans.ttf",
+        "C:/Windows/Fonts/arial.ttf",
+        "C:/Windows/Fonts/segoeui.ttf",
+        "/Library/Fonts/Arial.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+    ],
+    True: [
+        os.path.join(FONT_DIR, "font_bold.ttf"),
+        os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf"),
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSans-Bold.ttf",
+        "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+        "C:/Windows/Fonts/arialbd.ttf",
+        "C:/Windows/Fonts/segoeuib.ttf",
+        "/Library/Fonts/Arial Bold.ttf",
+        "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+    ],
+}
+_FONT_URLS = {
+    False: [
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans.ttf",
+        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans.ttf",
+    ],
+    True: [
+        "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf",
+        "https://raw.githubusercontent.com/dejavu-fonts/dejavu-fonts/master/ttf/DejaVuSans-Bold.ttf",
+    ],
+}
+_font_cache = {}
+def _find_font(bold):
+    """Путь к TTF-шрифту с кириллицей. Ищет в системе, в папке fonts/, иначе скачивает DejaVu."""
+    if bold in _font_cache:
+        return _font_cache[bold]
+    for path in _FONT_PATHS[bold]:
+        if os.path.exists(path):
+            _font_cache[bold] = path
+            return path
+    target = os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf")
+    for url in _FONT_URLS[bold]:
+        try:
+            os.makedirs(FONT_DIR, exist_ok=True)
+            req = urllib.request.Request(url, headers={"User-Agent": "vk-points-bot"})
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                content = resp.read()
+            if len(content) < 10000:
+                continue
+            with open(target, "wb") as f:
+                f.write(content)
+            print("Шрифт скачан:", target)
+            _font_cache[bold] = target
+            return target
+        except Exception as e:
+            print("Не удалось скачать шрифт:", repr(e))
+    return None
+def _fit_font(draw, text, path, size, max_width, min_size=16):
+    """Подбирает размер шрифта так, чтобы текст влез в max_width."""
+    while size > min_size:
+        font = ImageFont.truetype(path, size)
+        if draw.textlength(text, font=font) <= max_width:
+            return font
+        size -= 1
+    return ImageFont.truetype(path, min_size)
+# ---------- рисование ----------
+_PALETTE = [
+    (255, 170, 70),
+    (90, 200, 250),
+    (120, 220, 140),
+    (255, 110, 140),
+    (190, 145, 255),
+    (255, 215, 90),
+    (100, 230, 210),
+]
+def render_help_image(title, subtitle, sections):
+    """Рисует красивую картинку со списком команд. Возвращает BytesIO (PNG)."""
+    if not PIL_OK:
+        raise RuntimeError("Pillow не установлен")
+    reg = _find_font(False)
+    bold = _find_font(True) or reg
+    if not reg:
+        raise RuntimeError("не найден шрифт с кириллицей")
+
+    W = 1600
+    M = 40
+    GAP = 40
+    CW = (W - 2 * M - GAP) // 2
+    HEAD_H = 84
+    ROW_H = 92
+    PAD = 22
+    TOP = 200
+
+    # раскладка карточек по двум колонкам (в более короткую)
+    cols = [TOP, TOP]
+    placed = []
+    for idx, (name, rows) in enumerate(sections):
+        h = HEAD_H + len(rows) * ROW_H + PAD
+        col = 0 if cols[0] <= cols[1] else 1
+        x = M + col * (CW + GAP)
+        y = cols[col]
+        placed.append((idx, name, rows, x, y, h))
+        cols[col] += h + GAP
+    H = max(cols) + 70
+
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    # фон: плавный градиент
+    for y in range(H):
+        t = y / max(1, H - 1)
+        d.line([(0, y), (W, y)], fill=(int(16 + 24 * t), int(18 + 8 * t), int(40 + 34 * t)))
+
+    # заголовок
+    f_title = ImageFont.truetype(bold, 70)
+    f_sub = ImageFont.truetype(reg, 32)
+    d.text((M + 6, 38), title, font=f_title, fill=(255, 255, 255))
+    d.text((M + 8, 122), subtitle, font=f_sub, fill=(170, 180, 215))
+    # цветная полоска под заголовком
+    seg = (W - 2 * M) // len(_PALETTE)
+    for i, color in enumerate(_PALETTE):
+        d.rounded_rectangle((M + i * seg, 168, M + (i + 1) * seg - 6, 176), radius=4, fill=color)
+
+    f_head = ImageFont.truetype(bold, 38)
+    f_num = ImageFont.truetype(bold, 30)
+    for idx, name, rows, x, y, h in placed:
+        color = _PALETTE[idx % len(_PALETTE)]
+        # карточка
+        d.rounded_rectangle((x, y, x + CW, y + h), radius=28, fill=(29, 34, 66), outline=(56, 64, 108), width=2)
+        # номер раздела
+        d.ellipse((x + 24, y + 20, x + 68, y + 64), fill=color)
+        num = str(idx + 1)
+        nw = d.textlength(num, font=f_num)
+        d.text((x + 46 - nw / 2, y + 28), num, font=f_num, fill=(20, 22, 40))
+        d.text((x + 86, y + 20), name, font=f_head, fill=color)
+        d.line((x + 24, y + HEAD_H - 6, x + CW - 24, y + HEAD_H - 6), fill=color, width=2)
+        for i, (cmd, desc) in enumerate(rows):
+            ry = y + HEAD_H + i * ROW_H
+            max_w = CW - 56
+            f_cmd = _fit_font(d, cmd, bold, 34, max_w)
+            f_desc = _fit_font(d, desc, reg, 27, max_w)
+            d.text((x + 28, ry + 4), cmd, font=f_cmd, fill=(255, 255, 255))
+            d.text((x + 28, ry + 48), desc, font=f_desc, fill=(155, 166, 204))
+            if i < len(rows) - 1:
+                sy = ry + ROW_H - 6
+                d.line((x + 28, sy, x + CW - 28, sy), fill=(46, 54, 94), width=1)
+
+    f_foot = ImageFont.truetype(reg, 26)
+    foot = "Подробные пояснения — в сообщении под картинкой"
+    fw = d.textlength(foot, font=f_foot)
+    d.text(((W - fw) / 2, H - 52), foot, font=f_foot, fill=(130, 142, 185))
+
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    buf.name = "help.png"
+    return buf
+# ---------- загрузка в VK (один раз, дальше берётся из кэша) ----------
+HELP_PHOTO = {}
+help_lock = threading.Lock()
+def get_help_photo(kind):
+    """Возвращает attachment-строку картинки ('admin' или 'nadmin') или None, если не вышло."""
+    with help_lock:
+        cached = HELP_PHOTO.get(kind)
+        if cached:
+            return cached
+        if not PIL_OK:
+            print("Pillow не установлен — картинка-справка отключена (pip install Pillow).")
+            return None
+        try:
+            if kind == "admin":
+                buf = render_help_image(
+                    "Команды администратора",
+                    "Полный доступ  ·  два списка: /список (1) и /нлист (2)",
+                    ADMIN_SECTIONS,
+                )
+            else:
+                buf = render_help_image(
+                    "Команды администратора /нлист",
+                    "Доступ по /вдв  ·  работаете только со списком /нлист",
+                    NADMIN_SECTIONS,
+                )
+            upload = vk_api.VkUpload(vk_session)
+            photos = upload.photo_messages(photos=buf)
+            ph = photos[0]
+            attachment = "photo" + str(ph["owner_id"]) + "_" + str(ph["id"])
+            if ph.get("access_key"):
+                attachment += "_" + str(ph["access_key"])
+            HELP_PHOTO[kind] = attachment
+            print("Картинка-справка '" + kind + "' загружена:", attachment)
+            return attachment
+        except Exception as e:
+            print("Не удалось создать/загрузить картинку-справку '" + kind + "':", repr(e))
+            return None
+def send_admin_help(peer_id, user_id):
+    """Админам: картинка со всеми командами + пояснения текстом под ней."""
+    if user_id in ALLOWED_IDS:
+        kind, caption, fallback = "admin", ADMIN_CAPTION, ADMIN_HELP
+    else:
+        kind, caption, fallback = "nadmin", NADMIN_CAPTION, NADMIN_HELP
+    for _ in range(2):
+        attachment = get_help_photo(kind)
+        if not attachment:
+            break
+        try:
+            vk.messages.send(
+                peer_id=peer_id,
+                message=caption,
+                attachment=attachment,
+                random_id=get_random_id(),
+            )
+            return
+        except Exception as e:
+            print("Ошибка отправки картинки-справки:", repr(e))
+            with help_lock:
+                HELP_PHOTO.pop(kind, None)  # перезагрузим картинку заново
+    reply(peer_id, fallback)
 # ==========================================================
 # РАЗБОР КОМАНД С НОМЕРОМ СПИСКА (/привязать1, /привязать2 ...)
 # ==========================================================
@@ -1634,6 +1965,8 @@ def parse_payload(msg):
     except (TypeError, ValueError):
         return None
     return parsed if isinstance(parsed, dict) else None
+def is_any_admin(user_id):
+    return user_id in ALLOWED_IDS or user_id in NADMIN_IDS
 def process_event(event):
     if event.type != VkBotEventType.MESSAGE_NEW:
         return
@@ -1655,6 +1988,10 @@ def process_event(event):
             reply(peer_id, WELCOME_TEXT, menu_keyboard())
             return
         if payload.get("c"):
+            # админам кнопка «Помощь» тоже показывает картинку
+            if payload.get("c") == "help" and is_any_admin(from_id):
+                send_admin_help(peer_id, from_id)
+                return
             try:
                 answer, kb = button_response(from_id, payload)
             except Exception as e:
@@ -1696,6 +2033,16 @@ def process_event(event):
     raw_cmd = parts[0].lower()
     args = parts[1:]
     command, suffix = split_command(raw_cmd)
+
+    # /help и /хелп: админам (полный доступ и /вдв) — картинка + пояснения
+    if raw_cmd in ("/help", "/хелп") and is_any_admin(from_id):
+        try:
+            send_admin_help(peer_id, from_id)
+        except Exception as e:
+            print("Ошибка справки:", repr(e))
+            reply(peer_id, cmd_help(from_id))
+        return
+
     is_public = True
     public_answer = None
     try:
@@ -1770,6 +2117,9 @@ def main():
     )
     print("Владелец обращений (/написать):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
+    # заранее рисуем и загружаем картинки-справки, чтобы /help отвечал сразу
+    executor.submit(get_help_photo, "admin")
+    executor.submit(get_help_photo, "nadmin")
     while True:
         try:
             longpoll = VkBotLongPoll(vk_session, GROUP_ID)
