@@ -3,6 +3,7 @@ import re
 import json
 import time
 import zlib
+import html as html_lib
 import threading
 import urllib.request
 import urllib.error
@@ -11,6 +12,7 @@ from datetime import datetime, timedelta, timezone, date
 import vk_api
 from concurrent.futures import ThreadPoolExecutor
 from vk_api.bot_longpoll import VkBotLongPoll, VkBotEventType
+from vk_api.longpoll import VkLongPoll, VkEventType
 from vk_api.keyboard import VkKeyboard, VkKeyboardColor
 from vk_api.utils import get_random_id
 
@@ -53,18 +55,23 @@ PURCHASE_HISTORY_LIMIT = 200
 # Папка для шрифтов (для картинки-справки)
 FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 # ==========================================================
-# СТРАНИЧНЫЙ БОТ (второй токен от «Маруси»)
+# СТРАНИЧНЫЙ БОТ (аккаунт пользователя, подключённый командой +токен)
 # ==========================================================
 PAGE_TOKEN = None        # токен страничного бота
-PAGE_GROUP_ID = None     # ID группы, к которой подключён страничный бот
+PAGE_GROUP_ID = None     # (не используется для user-токена)
 PAGE_USER_ID = None      # VK ID пользователя, который подключил бота
 PAGE_VK = None           # VkApi-сессия для второго токена
-PAGE_LONGPOLL = None     # VkBotLongPoll для второго токена
+PAGE_LONGPOLL = None
 PAGE_READY = False       # флаг: страничный бот подключён и готов
-PAGE_STATE = {}          # peer_id -> {"stage": "...", "data": {...}}
-PAGE_NICKS = {}          # peer_id -> [nick1, nick2, ...]
-PAGE_REPORTS = {}        # peer_id -> {"дд.мм.гггг": {nick: "есть отчет N скринов"}}
+PAGE_STATE = {}          # peer_id (чат, где ввели команду) -> состояние проверки (сторона основного бота)
+PAGE_NICKS = {}
+PAGE_REPORTS = {}
 PAGE_NICKS_GIST = "nicks_reports.json"
+PAGE_GEN = 0             # «поколение» страничного бота: при смене токена старый поток сам завершается
+PAGE_THREAD = None
+PAGE_JOB = None          # текущая задача страничного бота (сторона страничного бота)
+page_lock = threading.Lock()
+PAGE_TIMEOUT = 240       # сколько секунд ждём результат проверки
 # ==========================================================
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
@@ -439,7 +446,7 @@ def _norm_page(raw_page):
     return {"token": token, "user_id": user_id if user_id > 0 else 0,
             "group_id": group_id if group_id > 0 else 0}
 def _norm_reports(raw_reports):
-    """"дд.мм.гггг" -> {"1": {nick: "есть отчет N скринов"/"нету отчета"/"отгул"}, "2": {...}}"""
+    """"дд.мм.гггг" -> {"1": {nick: "есть отчет N скринов"/"нет отчета"/"отгул"}, "2": {...}}"""
     result = {}
     if not isinstance(raw_reports, dict):
         return result
@@ -688,6 +695,30 @@ def reply(peer_id, text, keyboard=None, attachment=None):
         vk.messages.send(**params)
     except Exception as e:
         print("Ошибка отправки сообщения:", repr(e))
+def split_long_text(text, limit=3800):
+    """Режет длинный текст по строкам на куски до limit символов."""
+    chunks = []
+    cur = ""
+    for line in str(text).split("\n"):
+        while len(line) > limit:
+            if cur:
+                chunks.append(cur)
+                cur = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        add = line if not cur else "\n" + line
+        if len(cur) + len(add) > limit:
+            chunks.append(cur)
+            cur = line
+        else:
+            cur += add
+    if cur:
+        chunks.append(cur)
+    return chunks or [""]
+def reply_long(peer_id, text):
+    for chunk in split_long_text(text):
+        reply(peer_id, chunk)
+        time.sleep(0.2)
 def send_to_user(user_id, text):
     try:
         vk.messages.send(user_id=user_id, message=text, random_id=get_random_id())
@@ -739,14 +770,16 @@ def _get_page_vk():
         PAGE_GROUP_ID = group_id
     return PAGE_VK
 def send_to_page(user_id, text, keyboard=None):
-    """Отправляет сообщение подключённому страничному боту (через основной токен)."""
+    """Основной бот (токен сообщества) пишет страничному боту в ЛС."""
     try:
         params = {"user_id": user_id, "message": str(text), "random_id": get_random_id()}
         if keyboard:
             params["keyboard"] = keyboard
         vk.messages.send(**params)
+        return True
     except Exception as e:
         print("Ошибка отправки страничному боту:", repr(e))
+        return False
 def send_page_message(user_id, text, keyboard=None):
     """Отправляет сообщение от страничного бота (через второй токен)."""
     p_vk = _get_page_vk()
@@ -757,7 +790,7 @@ def send_page_message(user_id, text, keyboard=None):
         params = {"user_id": user_id, "message": str(text), "random_id": get_random_id()}
         if keyboard:
             params["keyboard"] = keyboard
-        p_vk.messages.send(**params)
+        p_vk.get_api().messages.send(**params)
         return True
     except Exception as e:
         print("Ошибка отправки от страничного бота:", repr(e))
@@ -1289,7 +1322,7 @@ def cmd_reply_to_user(msg, from_id, text):
         return "❌ Не удалось отправить ответ пользователю."
     return "✅ Ответ отправлен [id" + str(target_id) + "|пользователю]."
 # ==========================================================
-# ОТЧЁТЫ: /от дд.мм.гггг  и  /отчеты дд.мм.гггг
+# ОТЧЁТЫ: общие функции
 # ==========================================================
 REPORT_DATE_RE = r"(\d{2})\.(\d{2})\.(\d{4})"
 def parse_report_date(text):
@@ -1303,25 +1336,28 @@ def parse_report_date(text):
         return None
 def format_report_date(d):
     return d.strftime("%d.%m.%Y")
-def get_report_nicks(n):
-    """Список ников из P(n)."""
-    with lock:
-        return list(P(n).keys())
-def get_report_nick_info(n, nick_lower):
-    """Возвращает (nick, vk_id, status) для ника."""
-    p = P(n).get(nick_lower)
-    if p is None:
-        return None
-    with lock:
-        vacation = p.get("vacation")
-        otgul = p.get("otgul", 0)
-        if vacation:
-            status = "отпуск до " + str(vacation)
-        elif otgul:
-            status = "отгул"
-        else:
-            status = "работает"
-        return p["nick"], p["vk_id"], status
+def chunk_lines(lines, limit=3500):
+    """Группирует строки в сообщения до limit символов."""
+    chunks = []
+    cur = []
+    size = 0
+    for line in lines:
+        add = len(line) + 1
+        if cur and size + add > limit:
+            chunks.append("\n".join(cur))
+            cur = []
+            size = 0
+        cur.append(line)
+        size += add
+    if cur:
+        chunks.append("\n".join(cur))
+    return chunks
+def plural_screens(k):
+    if k % 10 == 1 and k % 100 != 11:
+        return "скрин"
+    if 2 <= k % 10 <= 4 and not (12 <= k % 100 <= 14):
+        return "скрина"
+    return "скринов"
 def extract_token(raw):
     """Вычищает токен из любого текста: переносы строк, пробелы, кавычки, слова вокруг."""
     raw = raw or ""
@@ -1369,26 +1405,14 @@ def cmd_report_connect(user_id, raw_text, group_id=""):
     try:
         test_vk = vk_api.VkApi(token=token)
         test_api = test_vk.get_api()
-        # account.getInfo() вернёт id текущего пользователя (работает с user-токеном)
+        # Для user-токена users.get() без параметров возвращает владельца токена
         try:
-            me = test_api.account.getInfo(fields="first_name,last_name")
-            if isinstance(me, list) and me:
+            me = test_api.users.get()
+            if me:
                 token_owner_id = int(me[0].get("id"))
                 token_owner_name = (me[0].get("first_name", "") + " " + me[0].get("last_name", "")).strip()
-            elif isinstance(me, dict):
-                token_owner_id = int(me.get("id", 0))
-                token_owner_name = (me.get("first_name", "") + " " + me.get("last_name", "")).strip()
         except Exception:
             pass
-        # Если не получилось — пробуем users.get (для старых токенов)
-        if not token_owner_id:
-            try:
-                me = test_api.users.get()
-                if me:
-                    token_owner_id = int(me[0].get("id"))
-                    token_owner_name = (me[0].get("first_name", "") + " " + me[0].get("last_name", "")).strip()
-            except Exception:
-                pass
         # Если всё ещё не получили id — возможно это токен сообщества
         if not token_owner_id:
             try:
@@ -1429,6 +1453,8 @@ def cmd_report_connect(user_id, raw_text, group_id=""):
     PAGE_VK = test_vk
     PAGE_GROUP_ID = 0
     PAGE_READY = True
+    # запускаем «живого» страничного бота (слушает ЛС с сообществом)
+    start_page_bot()
     st = get_report_settings()
     extra = ""
     if not st["group_id"] or not st["topic_ot"] or not st["topic_otchety"]:
@@ -1439,7 +1465,7 @@ def cmd_report_connect(user_id, raw_text, group_id=""):
             + ("/отобс отчеты <id> — обсуждение для /отчеты" if not st["topic_otchety"] else "")
         )
     return (
-        "✅ Страничный бот подключён.\n"
+        "✅ Страничный бот подключён и запущен.\n"
         "Пользователь: " + str(page_user_id) + (" («" + token_owner_name + "»)" if token_owner_name else "") + "\n"
         "Токен: " + token[:8] + "…" + token[-6:] + "\n"
         "Сохранён навсегда — при перезапуске подхватится сам." + extra
@@ -1452,11 +1478,21 @@ def cmd_report_disconnect(user_id):
             return "Страничный бот не подключён."
         data["page"] = {"token": "", "user_id": 0, "group_id": 0}
         save_data()
+    stop_page_bot()
     PAGE_TOKEN = None
     PAGE_VK = None
     PAGE_GROUP_ID = None
     PAGE_READY = False
     return "✅ Страничный бот отключён."
+# ==========================================================
+# ОТЧЁТЫ: сторона ОСНОВНОГО бота
+#   1. админ пишет в чате /отчеты дд.мм.гггг (или /от дд.мм.гггг)
+#   2. основной бот пишет страничному боту «/отчеты дд.мм.гггг»
+#   3. страничный бот отвечает «/список» (или «/нлист») — основной бот присылает ники
+#   4. страничный бот проверяет обсуждение, пишет там «все выше отчеты проверены»
+#      и присылает основному боту результаты
+#   5. основной бот публикует результаты в чат, где была введена команда
+# ==========================================================
 def cmd_reports_start(date_str, n, peer_id):
     """Начать проверку отчётов. n=1 для /отчеты, n=2 для /от."""
     if not is_page_connected():
@@ -1467,127 +1503,339 @@ def cmd_reports_start(date_str, n, peer_id):
     user_id = get_page_user_id()
     if not user_id:
         return "❌ Не удалось определить ID пользователя страничного бота."
-    nicks = get_report_nicks(n)
-    if not nicks:
-        return "Список пуст, проверять нечего."
-    # Собираем ники, у которых реально проверяем отчёт (без отгулов и отпусков)
-    check_list = []
-    for nick_lower in nicks:
-        info = get_report_nick_info(n, nick_lower)
-        if info is None:
-            continue
-        nick, vk_id, cur_status = info
-        if cur_status == "отгул" or cur_status.startswith("отпуск"):
-            continue
-        check_list.append(nick)
-    # Сохраняем состояние
-    PAGE_STATE[peer_id] = {
-        "stage": "waiting_results",
-        "n": n,
-        "date": date_str,
-        "target_date": target_date,
-        "nicks": [x.lower() for x in check_list],
-        "nick_titles": check_list,
-        "peer_id": peer_id,
-        "user_id": user_id,
-    }
-    if not check_list:
-        del PAGE_STATE[peer_id]
-        send_to_page(user_id, "Никто не требует проверки отчетов (все в отпуске или отгуле).")
-        return "Никто не требует проверки — все в отпуске или отгуле."
-    # Отправляем юзеру список ников для проверки
-    send_to_page(
-        user_id,
-        "Проверь отчеты за " + date_str + " для:\n" + "\n".join(check_list)
-        + "\n\nОтветь списком, по одному нику на строку:\nNick_Name есть отчет N скринов\nNick_Name нет отчета"
-    )
-    return "✅ Проверка отчётов запущена для " + date_str + " (" + ("списка /нлист" if n == 2 else "списка /список") + ")."
-def handle_page_results_reply(user_id, text):
-    """Обрабатывает результаты проверки отчётов от страничного бота."""
-    for peer_id, state in list(PAGE_STATE.items()):
-        if state.get("user_id") != user_id or state.get("stage") != "waiting_results":
-            continue
-        # Парсим результаты: "nick_name есть отчет n скринов"
-        results = {}
-        lines = text.strip().splitlines()
-        for line in lines:
-            line = line.strip().lower()
-            parts = line.split()
-            if not parts:
-                continue
-            nick = parts[0]
-            status = " ".join(parts[1:]) if len(parts) > 1 else "есть отчет"
-            results[nick] = status
-        state["results"] = results
-        state["stage"] = "done"
-        PAGE_STATE[peer_id] = state
-        # Отправляем в чат где была введена команда
-        n = state.get("n", 2)
-        date_str = state.get("date", "")
-        target_date = state.get("target_date")
-        nick_titles = state.get("nick_titles") or state.get("nicks", [])
-        # Формируем итоговое сообщение
-        msg_lines = ["📋 Отчёты за " + date_str + ":"]
-        saved_reports = {}
-        for real_nick in nick_titles:
-            nick_lower = real_nick.lower()
-            info = get_report_nick_info(n, nick_lower)
-            if info is None:
-                continue
-            actual_nick, vk_id, current_status = info
-            if current_status == "отгул":
-                msg_lines.append(real_nick + " — отгул")
-                saved_reports[nick_lower] = "отгул"
-                continue
-            status = results.get(nick_lower, "нету отчета")
-            if "есть" in status:
-                status = normalize_report_status(status, target_date)
-                msg_lines.append(real_nick + " — " + status)
-                saved_reports[nick_lower] = status
-            else:
-                msg_lines.append(real_nick + " — " + status)
-                saved_reports[nick_lower] = status
-        # Сохраняем в Gist
+    with lock:
+        if not P(n):
+            return "Список пуст, проверять нечего."
+        now = time.time()
+        # чистим протухшие проверки и не даём запускать две сразу
+        for key, st in list(PAGE_STATE.items()):
+            if now - st.get("ts", 0) > PAGE_TIMEOUT:
+                del PAGE_STATE[key]
+        if PAGE_STATE:
+            return "⏳ Проверка отчётов уже идёт, подождите её окончания."
+        PAGE_STATE[peer_id] = {
+            "stage": "waiting_list",
+            "n": n,
+            "date": date_str,
+            "target_date": target_date,
+            "peer_id": peer_id,
+            "user_id": user_id,
+            "ts": now,
+            "parts": {},
+            "total": 0,
+        }
+    # убеждаемся, что страничный бот слушает
+    if not (PAGE_THREAD and PAGE_THREAD.is_alive()):
+        start_page_bot()
+        time.sleep(3)
+    cmd = "/от" if n == 2 else "/отчеты"
+    if not send_to_page(user_id, cmd + " " + date_str):
         with lock:
-            day_key = format_report_date(target_date) if target_date else date_str
-            if "reports" not in data:
-                data["reports"] = {}
-            data["reports"][day_key] = saved_reports
-            # Добавляем ники
-            if "report_nicks" not in data:
-                data["report_nicks"] = {}
-            if day_key not in data["report_nicks"]:
-                data["report_nicks"][day_key] = {}
-            data["report_nicks"][day_key][str(n)] = {nk: nk for nk in nick_titles}
-            save_data()
-        # Отправляем в чат
-        reply(peer_id, "\n".join(msg_lines))
-        # Отправляем страничному боту "все выше отчеты проверены"
-        send_to_page(user_id, "все выше отчеты проверены")
-        # Удаляем состояние
-        del PAGE_STATE[peer_id]
+            PAGE_STATE.pop(peer_id, None)
+        return (
+            "❌ Не удалось написать страничному боту. Пусть он один раз напишет сообществу "
+            "(например /меню) и убедитесь, что сообщения сообщества включены."
+        )
+    return "✅ Проверка отчётов запущена для " + date_str + " (" + ("списка /нлист" if n == 2 else "списка /список") + "). Ждите результат."
+def _find_page_state(user_id):
+    best_peer = None
+    best = None
+    for peer, st in PAGE_STATE.items():
+        if st.get("user_id") != user_id:
+            continue
+        if best is None or st.get("ts", 0) > best.get("ts", 0):
+            best_peer, best = peer, st
+    return best_peer, best
+def _page_status_of(player):
+    """Статус игрока для страничного бота: работает / отгул / отпуск до ..."""
+    active, _ = vacation_active(player)
+    if active:
+        return "отпуск до " + str(player.get("vacation"))
+    if player.get("otgul", 0):
+        return "отгул"
+    return "работает"
+def handle_page_dialog(from_id, text):
+    """Сообщение от страничного бота основному. True — сообщение обработано."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    with lock:
+        peer_id, st = _find_page_state(from_id)
+    if st is None:
+        return False
+    if time.time() - st.get("ts", 0) > PAGE_TIMEOUT:
+        with lock:
+            PAGE_STATE.pop(peer_id, None)
+        return False
+    head = text.split(maxsplit=1)[0].lower()
+    stage = st.get("stage")
+
+    # Шаг 3: страничный бот запросил список -> шлём ники (и статусы)
+    if stage == "waiting_list":
+        if head not in ("/список", "/списко", "/нлист", "/nlist"):
+            return False
+        n = st["n"]
+        lines = []
+        changed = False
+        with lock:
+            for p in sorted(P(n).values(), key=lambda x: x["nick"].lower()):
+                _, ch = vacation_active(p)
+                changed = changed or ch
+                lines.append(p["nick"] + " | " + str(p["vk_id"]) + " | " + _page_status_of(p))
+            if changed:
+                save_data()
+            st["stage"] = "waiting_results"
+            st["ts"] = time.time()
+        chunks = chunk_lines(lines) or [""]
+        total = len(chunks)
+        for i, body in enumerate(chunks, 1):
+            send_to_page(from_id, "НИКИ " + str(i) + "/" + str(total) + "\n" + body)
+            time.sleep(0.3)
         return True
+
+    # Шаг 5: результаты проверки
+    if stage == "waiting_results":
+        if text.startswith("ОШИБКА"):
+            with lock:
+                PAGE_STATE.pop(peer_id, None)
+            reply(peer_id, "❌ Страничный бот: " + text[len("ОШИБКА"):].strip(": \n"))
+            return True
+        m = re.match(r"РЕЗУЛЬТАТЫ\s+(\d+)/(\d+)[ \t]*\n?(.*)", text, re.S)
+        if m:
+            idx = int(m.group(1))
+            total = int(m.group(2))
+            body = m.group(3).strip("\n")
+            with lock:
+                st["parts"][idx] = body
+                st["total"] = total
+                st["ts"] = time.time()
+                ready = len(st["parts"]) >= total
+            if ready:
+                finalize_page_results(peer_id, st)
+            return True
+        if text.startswith("/"):
+            return False
+        return True   # «ники получены, проверяю отчеты» и прочее — игнорируем
     return False
-def normalize_report_status(status, target_date):
-    """Если в отчёте указана дата на день раньше target_date — засчитываем (отчёт сдан сегодня за вчера).
-    Проверка только за target_date и день до него."""
-    if target_date is None:
-        return status
-    # Допустимая дата отчёта = target_date или день раньше (сдан сегодня за вчера)
-    allowed_dates = {target_date, target_date - timedelta(days=1)}
-    match = re.search(REPORT_DATE_RE, status)
-    if match:
+def finalize_page_results(peer_id, st):
+    """Публикует результаты в чат, где была введена команда, и сохраняет их."""
+    n = st.get("n", 2)
+    date_str = st.get("date", "")
+    parts = st.get("parts", {})
+    body = "\n".join(parts[i] for i in sorted(parts))
+    lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    saved = {}
+    for ln in lines:
+        nick, _, status = ln.partition(" ")
+        if nick:
+            saved[nick] = status.strip()
+    with lock:
+        PAGE_STATE.pop(peer_id, None)
+        if saved:
+            data.setdefault("reports", {}).setdefault(date_str, {})[str(n)] = saved
+            save_data()
+    out = "📋 Отчёты за " + date_str + " (" + LIST_TITLE[n] + "):\n" + ("\n".join(lines) if lines else "пусто")
+    reply_long(peer_id, out)
+# ==========================================================
+# ОТЧЁТЫ: сторона СТРАНИЧНОГО БОТА (аккаунт пользователя, longpoll по user-токену)
+# ==========================================================
+def stop_page_bot():
+    global PAGE_GEN, PAGE_JOB
+    with page_lock:
+        PAGE_GEN += 1
+        PAGE_JOB = None
+def start_page_bot():
+    """(Пере)запускает поток страничного бота."""
+    global PAGE_GEN, PAGE_THREAD, PAGE_JOB
+    with page_lock:
+        PAGE_GEN += 1
+        PAGE_JOB = None
+        gen = PAGE_GEN
+        if not data.get("page", {}).get("token"):
+            return
+        t = threading.Thread(target=page_bot_loop, args=(gen,), daemon=True)
+        PAGE_THREAD = t
+        t.start()
+def page_send(api, text):
+    """Страничный бот (user-токен) пишет в диалог с сообществом."""
+    api.messages.send(peer_id=-GROUP_ID, message=text, random_id=get_random_id())
+def page_bot_loop(gen):
+    print("Страничный бот: поток запущен.")
+    while gen == PAGE_GEN:
         try:
-            found_date = date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
-            if found_date in allowed_dates:
-                # Отчёт засчитывается за target_date
-                status = re.sub(REPORT_DATE_RE, format_report_date(target_date), status)
+            token = data.get("page", {}).get("token", "")
+            if not token:
+                return
+            sess = vk_api.VkApi(token=token)
+            api = sess.get_api()
+            lp = VkLongPoll(sess, wait=25, mode=2)
+            print("Страничный бот: слушаю сообщения от сообщества.")
+            while gen == PAGE_GEN:
+                for ev in lp.check():
+                    if gen != PAGE_GEN:
+                        break
+                    if ev.type != VkEventType.MESSAGE_NEW:
+                        continue
+                    try:
+                        page_on_message(api, ev)
+                    except Exception as e:
+                        print("Страничный бот: ошибка обработки:", repr(e))
+        except Exception as e:
+            print("Страничный бот: соединение прервано:", repr(e))
+            time.sleep(8)
+    print("Страничный бот: поток остановлен.")
+def _page_message_text(api, ev):
+    """Полный текст сообщения (longpoll может обрезать длинные)."""
+    try:
+        res = api.messages.getById(message_ids=ev.message_id)
+        items = res.get("items") if isinstance(res, dict) else res
+        if items:
+            return items[0].get("text") or ""
+    except Exception as e:
+        print("Страничный бот: getById не удался:", repr(e))
+    raw = getattr(ev, "text", "") or ""
+    return html_lib.unescape(raw.replace("<br>", "\n"))
+def page_on_message(api, ev):
+    global PAGE_JOB
+    if getattr(ev, "from_me", False):
+        return
+    if getattr(ev, "peer_id", None) != -GROUP_ID:
+        return
+    text = _page_message_text(api, ev).strip()
+    if not text:
+        return
+    low = text.lower()
+
+    # Команда от основного бота: /от дд.мм.гггг  или  /отчеты дд.мм.гггг
+    m = re.fullmatch(r"/(от|отчеты|отчёты)\s+(\d{2}\.\d{2}\.\d{4})", low)
+    if m:
+        target = parse_report_date(m.group(2))
+        if target is None:
+            return
+        n = 2 if m.group(1) == "от" else 1
+        PAGE_JOB = {
+            "n": n, "date": m.group(2), "target": target,
+            "parts": {}, "total": 0, "ts": time.time(),
+        }
+        page_send(api, "/нлист" if n == 2 else "/список")
+        return
+
+    # Список ников от основного бота
+    m = re.match(r"НИКИ\s+(\d+)/(\d+)[ \t]*\n?(.*)", text, re.S)
+    if m:
+        job = PAGE_JOB
+        if not job:
+            return
+        job["parts"][int(m.group(1))] = m.group(3)
+        job["total"] = int(m.group(2))
+        if len(job["parts"]) < job["total"]:
+            return
+        PAGE_JOB = None
+        try:
+            page_send(api, "ники получены, проверяю отчеты")
+            page_run_check(api, job)
+        except Exception as e:
+            print("Страничный бот: ошибка проверки:", repr(e))
+            try:
+                page_send(api, "ОШИБКА: " + str(e)[:300])
+            except Exception as e2:
+                print("Страничный бот: не удалось сообщить об ошибке:", repr(e2))
+def _count_images(comment):
+    k = 0
+    for a in comment.get("attachments") or []:
+        t = a.get("type")
+        if t == "photo":
+            k += 1
+        elif t == "doc":
+            ext = ((a.get("doc") or {}).get("ext") or "").lower()
+            if ext in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+                k += 1
+    return k
+def fetch_topic_comments(api, group_id, topic_id, ts_from, ts_to):
+    """Все комментарии обсуждения за период [ts_from, ts_to)."""
+    result = []
+    offset = 0
+    while True:
+        resp = api.board.getComments(
+            group_id=group_id, topic_id=topic_id,
+            sort="desc", count=100, offset=offset,
+        )
+        items = resp.get("items") or []
+        if not items:
+            break
+        stop = False
+        for c in items:
+            d = c.get("date", 0)
+            if d < ts_from:
+                stop = True
+                break
+            if d < ts_to:
+                result.append(c)
+        offset += len(items)
+        if stop or offset >= resp.get("count", 0):
+            break
+        time.sleep(0.35)
+    return result
+def page_run_check(api, job):
+    n = job["n"]
+    target = job["target"]
+    st = get_report_settings()
+    group_id = st["group_id"]
+    topic_id = st["topic_otchety"] if n == 1 else st["topic_ot"]
+    if not group_id or not topic_id:
+        raise RuntimeError("не задано сообщество или обсуждение (/отместо)")
+
+    # ники, которые прислал основной бот: Nick | vk_id | статус
+    entries = []
+    for part in sorted(job["parts"]):
+        for line in job["parts"][part].splitlines():
+            cols = [c.strip() for c in line.split("|")]
+            if len(cols) < 3 or not cols[0]:
+                continue
+            try:
+                vid = int(cols[1])
+            except ValueError:
+                vid = 0
+            entries.append((cols[0], vid, cols[2]))
+
+    # смотрим обсуждение за этот день (по МСК)
+    shots = {}
+    need_check = any(e[2].lower() == "работает" for e in entries)
+    if need_check:
+        start = datetime(target.year, target.month, target.day, tzinfo=MSK)
+        ts_from = int(start.timestamp())
+        ts_to = int((start + timedelta(days=1)).timestamp())
+        comments = fetch_topic_comments(api, group_id, topic_id, ts_from, ts_to)
+        for c in comments:
+            author = c.get("from_id", 0)
+            shots[author] = shots.get(author, 0) + _count_images(c)
+
+    # пишем в обсуждении, что проверка закончена
+    try:
+        api.board.createComment(
+            group_id=group_id, topic_id=topic_id,
+            message="все выше отчеты проверены",
+            guid=str(get_random_id()),
+        )
+    except Exception as e:
+        print("Страничный бот: не удалось написать в обсуждение:", repr(e))
+
+    # итог для основного бота
+    lines = []
+    for nick, vid, status in entries:
+        if status.lower() == "работает":
+            k = shots.get(vid, 0)
+            if k > 0:
+                lines.append(nick + " есть отчет " + str(k) + " " + plural_screens(k))
             else:
-                # Не за этот день — не засчитываем
-                return "нету отчета (дата " + match.group(0) + " не за " + format_report_date(target_date) + ")"
-        except ValueError:
-            pass
-    return status
+                lines.append(nick + " нет отчета")
+        else:
+            lines.append(nick + " " + status)   # «отгул» или «отпуск до дд.мм»
+    chunks = chunk_lines(lines) or [""]
+    total = len(chunks)
+    for i, body in enumerate(chunks, 1):
+        page_send(api, "РЕЗУЛЬТАТЫ " + str(i) + "/" + str(total) + "\n" + body)
+        time.sleep(0.4)
 # ==========================================================
 # ОТЧЁТЫ: где проверять (сообщество + обсуждения)
 # ==========================================================
@@ -1614,7 +1862,7 @@ def settings_warning(n):
 def cmd_report_settings(raw_cmd, args, user_id):
     """/отгруппа <id> — где лежат отчёты. /отобс от|отчеты <topic_id> — какое обсуждение.
     /отместо — показать текущие настройки. Только общие админы."""
-    if user_id not in ALLOWED_IDS:
+    if user_id not in ALLOWED_IDS and not (raw_cmd == "/отместо" and user_id in NADMIN_IDS):
         return None
     st = get_report_settings()
     if raw_cmd == "/отместо":
@@ -1630,20 +1878,14 @@ def cmd_report_settings(raw_cmd, args, user_id):
             "/отобс отчеты 2 — обсуждение для /отчеты"
         )
         return "\n".join(lines)
+    if user_id not in ALLOWED_IDS:
+        return None
     if raw_cmd == "/отгруппа":
         if len(args) != 1 or not re.fullmatch(r"-?\d+", args[0]):
             return "Формат: /отгруппа 123456"
         gid = abs(int(args[0]))
         if gid <= 0:
             return "ID сообщества должен быть больше 0."
-        try:
-            vk.messages.send(
-                peer_id=2000000000 + gid,
-                message=".",
-                random_id=get_random_id(),
-            )
-        except Exception:
-            pass  # проверка не критична: сообщество может не принимать сообщения бота
         with lock:
             data["report_settings"] = {**st, "group_id": gid}
             save_data()
@@ -2559,7 +2801,7 @@ def handle(text, user_id, peer_id=0):
         return cmd_broadcast_all(text) if is_common else None
 
     # Отчёты — общие админы: /отчеты дд.мм.гггг, /вдв админы: /от дд.мм.гггг
-    if raw_cmd == "/отчеты":
+    if raw_cmd in ("/отчеты", "/отчёты"):
         if not is_common:
             return None
         if len(args) != 1:
@@ -2693,37 +2935,29 @@ def process_event(event):
         reply(peer_id, WELCOME_TEXT if is_new else MENU_TEXT, menu_keyboard())
         return
 
-    # === Секретная команда +токен (любой, в ЛС; в /help не светится) ===
-    if text.startswith("+токен"):
+    # === Секретная команда +токен (только в ЛС; в /help не светится) ===
+    if is_dm and text.startswith("+токен"):
         rest = text[len("+токен"):].strip()
         answer = cmd_report_connect(from_id, rest)
         reply(peer_id, answer)
         return
 
+    # === Секретная команда -токен: отключить страничного бота (только общие админы) ===
+    if is_dm and text.startswith("-токен") and from_id in ALLOWED_IDS:
+        reply(peer_id, cmd_report_disconnect(from_id))
+        return
+
     # ======================================================
-    # ОТЧЁТЫ: обработка результатов проверки от подключённого юзера
+    # ОТЧЁТЫ: диалог со страничным ботом (его сообщения в ЛС сообщества).
+    # Если активной проверки нет — сообщение обрабатывается как обычное.
     # ======================================================
     if is_dm and is_page_connected() and from_id == get_page_user_id():
-        page_user_id = get_page_user_id()
-        # Ищем активное состояние отчёта для этого пользователя
-        for peer_id_s, state in list(PAGE_STATE.items()):
-            if state.get("user_id") != page_user_id:
-                continue
-            stage = state.get("stage", "")
-            # Ждём результаты проверки от юзера
-            if stage == "waiting_results":
-                # «ники получены, проверяю отчеты» — это не результат, а просто подтверждение
-                lower_text = text.lower()
-                if "получены" in lower_text or "проверяю" in lower_text:
-                    return
-                # Парсим результаты и отправляем в чат
-                if handle_page_results_reply(page_user_id, text):
-                    return
+        try:
+            if handle_page_dialog(from_id, text):
                 return
-        # Подключённый юзер, но активного запроса нет — не мешаем ему писать боту
-        if not text.startswith("/"):
+        except Exception as e:
+            print("Ошибка диалога со страничным ботом:", repr(e))
             return
-
 
     # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
@@ -2805,7 +3039,7 @@ def process_event(event):
         print("Ошибка команды:", repr(e))
         answer = "Произошла ошибка при выполнении команды."
     if answer:
-        reply(peer_id, answer)
+        reply_long(peer_id, answer)
 def safe_process(event):
     try:
         process_event(event)
@@ -2842,8 +3076,9 @@ def main():
     page = data.get("page", {})
     if page.get("token"):
         print("Страничный бот подключён: user=" + str(page.get("user_id")))
+        start_page_bot()
     else:
-        print("Страничный бот не подключён. Для подключения: напиши в ЛС /токен vk1.a.xxxxx")
+        print("Страничный бот не подключён. Для подключения: напиши боту в ЛС +токен vk1.a.xxxxx")
     rst = get_report_settings()
     print(
         "Проверка отчётов — сообщество:", rst["group_id"] or "не задано (/отгруппа)",
