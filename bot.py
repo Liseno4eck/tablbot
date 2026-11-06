@@ -567,7 +567,7 @@ def load_data():
         PAGE_READY = True
         try:
             PAGE_VK = vk_api.VkApi(token=PAGE_TOKEN)
-            print("Страничный бот восстановлен из файла: user=" + str(page.get("user_id")) + " group=" + str(PAGE_GROUP_ID))
+            print("Страничный бот восстановлен из файла: user=" + str(page.get("user_id")))
         except Exception as e:
             print("Не удалось восстановить страничный бот:", repr(e))
     if need_push:
@@ -1350,20 +1350,11 @@ def extract_group_id(raw):
     m = re.search(r"(?:^|\D)(-?\d{5,12})(?!\d)", raw)
     return abs(int(m.group(1))) if m else 0
 def cmd_report_connect(user_id, raw_text, group_id=""):
-    """Команда +токен: подключить страничный бот.
-    Принимает СЫРОЙ текст после команды: бот сам вытаскивает токен и сам
-    определяет, к какому сообществу он привязан (ID группы указывать не нужно)."""
+    """Команда +токен: подключить страничного бота.
+    Принимает СЫРОЙ текст после команды: бот сам вытаскивает токен и проверяет его."""
     global PAGE_TOKEN, PAGE_VK, PAGE_GROUP_ID, PAGE_READY
     # извлекаем токен и (опционально) ID группы из всего, что прислал человек
     token = extract_token(raw_text)
-    wanted_gid = extract_group_id(raw_text)
-    if group_id:
-        try:
-            gid_arg = abs(int(re.sub(r"\D", "", str(group_id)) or 0))
-        except ValueError:
-            gid_arg = 0
-        if gid_arg:
-            wanted_gid = gid_arg
     if not token:
         return (
             "❌ Не нашёл токен в сообщении.\n"
@@ -1371,39 +1362,72 @@ def cmd_report_connect(user_id, raw_text, group_id=""):
             "+токен vk1.a.XXXXXXXXXXXX"
         )
     if not re.fullmatch(r"[A-Za-z0-9_.\-]{10,512}", token):
-        return "❌ Токен выглядит некорректно: " + token[:20] + "...\nНужен ключ сообщества (vk1.a....)."
-    # проверяем токен и сами узнаём его сообщество
+        return "❌ Токен выглядит некорректно: " + token[:20] + "..."
+    # Проверяем токен через users.get() — это работает только с токеном пользователя
+    token_owner_id = 0
+    token_owner_name = ""
     try:
         test_vk = vk_api.VkApi(token=token)
         test_api = test_vk.get_api()
-        info = test_api.groups.getById()
-        if isinstance(info, dict):
-            info = info.get("groups") or []
-        if not info:
-            return "❌ Этот токен не привязан ни к одному сообществу.\nНужен КЛЮЧ СООБЩЕСТВА, а не ключ пользователя."
-        token_gid = int(info[0].get("id"))
-        token_name = info[0].get("name") or "сообщество"
+        # account.getInfo() вернёт id текущего пользователя (работает с user-токеном)
+        try:
+            me = test_api.account.getInfo(fields="first_name,last_name")
+            if isinstance(me, list) and me:
+                token_owner_id = int(me[0].get("id"))
+                token_owner_name = (me[0].get("first_name", "") + " " + me[0].get("last_name", "")).strip()
+            elif isinstance(me, dict):
+                token_owner_id = int(me.get("id", 0))
+                token_owner_name = (me.get("first_name", "") + " " + me.get("last_name", "")).strip()
+        except Exception:
+            pass
+        # Если не получилось — пробуем users.get (для старых токенов)
+        if not token_owner_id:
+            try:
+                me = test_api.users.get()
+                if me:
+                    token_owner_id = int(me[0].get("id"))
+                    token_owner_name = (me[0].get("first_name", "") + " " + me[0].get("last_name", "")).strip()
+            except Exception:
+                pass
+        # Если всё ещё не получили id — возможно это токен сообщества
+        if not token_owner_id:
+            try:
+                info = test_api.groups.getById()
+                if isinstance(info, dict):
+                    info = info.get("groups") or []
+                if info:
+                    return (
+                        "❌ Это токен сообщества, а нужен токен пользователя.\n"
+                        "Токен пользователя получается через vk.com/dev → «Создать токен» (с правами messages).\n"
+                        "Или: Управление сообществом → Настройки → Работа с API → Ключи API → Ключ пользователя"
+                    )
+            except Exception:
+                pass
+            return "❌ Не удалось проверить токен — возможно он неверный или просрочен."
     except vk_api.exceptions.ApiError as e:
         code = getattr(e, "code", "?")
         hint = ""
         if code == 5:
-            hint = "\nТокен устарел или отозван — создайте новый в настройках сообщества."
+            hint = "\nТокен устарел или отозван — создайте новый."
         elif code == 9:
             hint = "\nТокен не найден — скопируйте его целиком (начинается с vk1.a.)."
+        elif code == 15:
+            hint = "\nЭтот токен не имеет прав на работу с сообщениями. Нужен токен с правом messages."
         return "❌ VK отверг этот токен (код " + str(code) + ")." + hint
     except Exception as e:
         return "❌ Не удалось подключиться: " + repr(e)
-    # ID группы всегда берём из токена — слушать другую группу этим ключом нельзя
-    gid = token_gid
-    warn = ""
-    if wanted_gid and wanted_gid != gid:
-        warn = "\n⚠️ Вы указали " + str(wanted_gid) + ", но этот ключ принадлежит " + str(gid) + " — взял из токена."
+    # Сохраняем: страничный бот — это пользователь, чей токен
+    page_user_id = token_owner_id
     with lock:
-        data["page"] = {"token": token, "user_id": user_id, "group_id": gid}
+        data["page"] = {
+            "token": token,
+            "user_id": page_user_id,
+            "group_id": 0,   # для user-токена группа не нужна
+        }
         save_data()
     PAGE_TOKEN = token
     PAGE_VK = test_vk
-    PAGE_GROUP_ID = gid
+    PAGE_GROUP_ID = 0
     PAGE_READY = True
     st = get_report_settings()
     extra = ""
@@ -1416,9 +1440,9 @@ def cmd_report_connect(user_id, raw_text, group_id=""):
         )
     return (
         "✅ Страничный бот подключён.\n"
-        "Сообщество: " + str(gid) + " («" + token_name + "»)\n"
+        "Пользователь: " + str(page_user_id) + (" («" + token_owner_name + "»)" if token_owner_name else "") + "\n"
         "Токен: " + token[:8] + "…" + token[-6:] + "\n"
-        "Сохранён навсегда — при перезапуске подхватится сам." + warn + extra
+        "Сохранён навсегда — при перезапуске подхватится сам." + extra
     )
 def cmd_report_disconnect(user_id):
     """Команда -токен: отключить страничный бот."""
@@ -1478,7 +1502,7 @@ def handle_page_nicks_reply(user_id, text):
         state["stage"] = "waiting_confirm"
         PAGE_STATE[peer_id] = state
         # Ответ страничному боту
-        send_page_message(user_id, "ники получены, проверяю отчеты")
+        send_to_page(user_id, "ники получены, проверяю отчеты")
         return True
     return False
 def handle_page_confirm_reply(user_id, text):
@@ -1551,7 +1575,7 @@ def handle_page_results_reply(user_id, text):
         # Отправляем в чат
         reply(peer_id, "\n".join(msg_lines))
         # Отправляем страничному боту "все выше отчеты проверены"
-        send_page_message(user_id, "все выше отчеты проверены")
+        send_to_page(user_id, "все выше отчеты проверены")
         # Удаляем состояние
         del PAGE_STATE[peer_id]
         return True
@@ -2860,7 +2884,7 @@ def main():
     print("Сегодня (МСК):", today_local().isoformat())
     page = data.get("page", {})
     if page.get("token"):
-        print("Страничный бот подключён: user=" + str(page.get("user_id")) + " group=" + str(page.get("group_id")))
+        print("Страничный бот подключён: user=" + str(page.get("user_id")))
     else:
         print("Страничный бот не подключён. Для подключения: напиши в ЛС /токен vk1.a.xxxxx")
     rst = get_report_settings()
