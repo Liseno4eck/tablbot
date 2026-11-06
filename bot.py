@@ -70,11 +70,11 @@ NICKS_GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
 # ID сообщества, в котором игроки скидывают отчёты.
-REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "0") or 0)
+REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "221245909") or 0)
 # Обсуждение, где проверяются отчёты для /от  (список /нлист)
-REPORT_TOPIC_ID_OT = int(os.environ.get("REPORT_TOPIC_ID_OT", "0") or 0)
+REPORT_TOPIC_ID_OT = int(os.environ.get("REPORT_TOPIC_ID_OT", "56455927") or 0)
 # Обсуждение, где проверяются отчёты для /отчеты  (список /список)
-REPORT_TOPIC_ID_OTCHETY = int(os.environ.get("REPORT_TOPIC_ID_OTCHETY", "0") or 0)
+REPORT_TOPIC_ID_OTCHETY = int(os.environ.get("REPORT_TOPIC_ID_OTCHETY", "56568576") or 0)
 # ==========================================================
 def _clean_gist_id(value):
     value = (value or "").strip()
