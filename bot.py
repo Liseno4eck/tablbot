@@ -65,7 +65,6 @@ PAGE_STATE = {}          # peer_id -> {"stage": "...", "data": {...}}
 PAGE_NICKS = {}          # peer_id -> [nick1, nick2, ...]
 PAGE_REPORTS = {}        # peer_id -> {"дд.мм.гггг": {nick: "есть отчет N скринов"}}
 PAGE_NICKS_GIST = "nicks_reports.json"
-NICKS_GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 # ==========================================================
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
@@ -86,6 +85,7 @@ GIST_TOKEN = (os.environ.get("GIST_TOKEN", "") or GIST_TOKEN_FALLBACK).strip()
 GIST_ID = _clean_gist_id(os.environ.get("GIST_ID", "") or GIST_ID_FALLBACK)
 GIST_FILENAME = "data.json"
 GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
+NICKS_GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
 ON_GITHUB_ACTIONS = os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
 DEBUG = False
 # ==========================================================
