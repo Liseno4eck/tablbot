@@ -69,11 +69,11 @@ PAGE_NICKS_GIST = "nicks_reports.json"
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
 # ID сообщества, в котором игроки скидывают отчёты.
-REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "221245909") or 0)
+REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "0") or 0)
 # Обсуждение, где проверяются отчёты для /от  (список /нлист)
-REPORT_TOPIC_ID_OT = int(os.environ.get("REPORT_TOPIC_ID_OT", "56455927") or 0)
+REPORT_TOPIC_ID_OT = int(os.environ.get("REPORT_TOPIC_ID_OT", "0") or 0)
 # Обсуждение, где проверяются отчёты для /отчеты  (список /список)
-REPORT_TOPIC_ID_OTCHETY = int(os.environ.get("REPORT_TOPIC_ID_OTCHETY", "56568576") or 0)
+REPORT_TOPIC_ID_OTCHETY = int(os.environ.get("REPORT_TOPIC_ID_OTCHETY", "0") or 0)
 # ==========================================================
 def _clean_gist_id(value):
     value = (value or "").strip()
@@ -1374,7 +1374,7 @@ def cmd_reports_start(date_str, n, peer_id):
         return "Список пуст, проверять нечего."
     # Сохраняем состояние
     PAGE_STATE[peer_id] = {
-        "stage": "waiting_nicks",
+        "stage": "waiting_list",
         "n": n,
         "date": date_str,
         "target_date": target_date,
@@ -1439,28 +1439,28 @@ def handle_page_results_reply(user_id, text):
         n = state.get("n", 2)
         date_str = state.get("date", "")
         target_date = state.get("target_date")
-        nicks = state.get("nicks", [])
+        nick_titles = state.get("nick_titles") or state.get("nicks", [])
         # Формируем итоговое сообщение
-        lines = ["📋 Отчёты за " + date_str + ":"]
+        msg_lines = ["📋 Отчёты за " + date_str + ":"]
         saved_reports = {}
-        for nick_lower in nicks:
+        for real_nick in nick_titles:
+            nick_lower = real_nick.lower()
             info = get_report_nick_info(n, nick_lower)
             if info is None:
                 continue
-            nick, vk_id, current_status = info
+            actual_nick, vk_id, current_status = info
             if current_status == "отгул":
-                lines.append(nick + " — отгул")
-                saved_reports[nick] = "отгул"
+                msg_lines.append(real_nick + " — отгул")
+                saved_reports[nick_lower] = "отгул"
                 continue
             status = results.get(nick_lower, "нету отчета")
             if "есть" in status:
-                # Проверяем дату в отчёте: если указана вчерашняя, а сдана сегодня — засчитываем за сегодня
                 status = normalize_report_status(status, target_date)
-                lines.append(nick + " — " + status)
-                saved_reports[nick] = status
+                msg_lines.append(real_nick + " — " + status)
+                saved_reports[nick_lower] = status
             else:
-                lines.append(nick + " — " + status)
-                saved_reports[nick] = status
+                msg_lines.append(real_nick + " — " + status)
+                saved_reports[nick_lower] = status
         # Сохраняем в Gist
         with lock:
             day_key = format_report_date(target_date) if target_date else date_str
@@ -1472,10 +1472,10 @@ def handle_page_results_reply(user_id, text):
                 data["report_nicks"] = {}
             if day_key not in data["report_nicks"]:
                 data["report_nicks"][day_key] = {}
-            data["report_nicks"][day_key][str(n)] = {nk: nk for nk in nicks}
+            data["report_nicks"][day_key][str(n)] = {nk: nk for nk in nick_titles}
             save_data()
         # Отправляем в чат
-        reply(peer_id, "\n".join(lines))
+        reply(peer_id, "\n".join(msg_lines))
         # Отправляем страничному боту "все выше отчеты проверены"
         send_page_message(user_id, "все выше отчеты проверены")
         # Удаляем состояние
@@ -2502,11 +2502,6 @@ def handle(text, user_id, peer_id=0):
     if raw_cmd == "/отобс":
         return cmd_report_settings(raw_cmd, args, user_id)
 
-    # Секретная команда +токен (обработана выше в process_event для всех в ЛС)
-    if raw_cmd == "+токен":
-        return None
-    return None
-
     command, suffix = split_command(raw_cmd)
     if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
         return None
@@ -2626,6 +2621,60 @@ def process_event(event):
         reply(peer_id, answer)
         return
 
+    # ======================================================
+    # ОТЧЁТЫ: обработка сообщений от подключённого юзера
+    # (идёт ДО диалога отпуска — иначе "ники получены" без слэша
+    #  перехватывался бы блоком отпуска)
+    # ======================================================
+    if is_dm and is_page_connected() and from_id == get_page_user_id():
+        page_user_id = get_page_user_id()
+        cmd_head = text.strip().split(maxsplit=1)[0].lower() if text.strip() else ""
+        lower_text = text.lower()
+        # Ищем активное состояние отчёта для этого пользователя
+        for peer_id_s, state in list(PAGE_STATE.items()):
+            if state.get("user_id") != page_user_id:
+                continue
+            stage = state.get("stage", "")
+            # Этап 1: юзер должен сам запросить список ников
+            if stage == "waiting_list":
+                if cmd_head in ("/нлист", "/список", "/nlist"):
+                    n = state.get("n", 2)
+                    with lock:
+                        players = list(P(n).values())
+                    nick_list = []
+                    for p in players:
+                        info = get_report_nick_info(n, p["nick"].lower())
+                        if info is None:
+                            continue
+                        nick, vk_id, cur_status = info
+                        # отгул и отпуск в список не отдаём — их отчёт не проверяется
+                        if cur_status == "отгул" or cur_status.startswith("отпуск"):
+                            continue
+                        nick_list.append(nick)
+                    if not nick_list:
+                        send_to_page(from_id, "Список пуст.")
+                        del PAGE_STATE[peer_id_s]
+                        return
+                    send_to_page(from_id, " ".join(nick_list))
+                    state["nicks"] = [x.lower() for x in nick_list]
+                    state["nick_titles"] = nick_list
+                    state["stage"] = "waiting_results"
+                    PAGE_STATE[peer_id_s] = state
+                    return
+                return
+            # Этап 2: ждём результаты проверки
+            if stage == "waiting_results":
+                # «ники/списки получены, проверяю отчеты» — просто подтверждение, ждём дальше
+                if "получены" in lower_text or "проверяю" in lower_text:
+                    return
+                if handle_page_results_reply(page_user_id, text):
+                    return
+                return
+        # Подключённый юзер, но активного запроса нет — не мешаем ему писать боту
+        if not text.startswith("/"):
+            return
+
+
     # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
         handled = False
@@ -2641,66 +2690,6 @@ def process_event(event):
         # новый пользователь написал что угодно — сразу показываем кнопки
         if is_dm and is_new and not handled:
             reply(peer_id, WELCOME_TEXT, menu_keyboard())
-        return
-
-    # ======================================================
-    # ОТЧЁТЫ: обработка сообщений от подключённого юзера
-    # ======================================================
-    if is_dm and is_page_connected() and from_id == get_page_user_id():
-        page_user_id = get_page_user_id()
-        # Ищем активное состояние отчёта для этого пользователя
-        for peer_id_s, state in list(PAGE_STATE.items()):
-            if state.get("user_id") != page_user_id:
-                continue
-            stage = state.get("stage", "")
-            # Этап: ожидает /нлист от подключённого юзера
-            if stage == "waiting_nicks":
-                # Если юзер отправил /нлист — отправляем ники
-                if raw_cmd == "/нлист" or raw_cmd == "/список":
-                    n = state.get("n", 2)
-                    nicks = get_report_nicks(n)
-                    if nicks:
-                        send_to_page(from_id, " ".join(nicks))
-                    else:
-                        send_to_page(from_id, "Список пуст.")
-                    return
-                # Если юзер отправил "ники получены..." — запускаем проверку
-                lower_text = text.lower()
-                if "ники получены" in lower_text or "проверяю" in lower_text:
-                    handle_page_confirm_reply(page_user_id, text)
-                    # Проверяем каждый ник и отправляем результаты
-                    n = state.get("n", 2)
-                    nicks = state.get("nicks", [])
-                    target_date = state.get("target_date")
-                    results = {}
-                    for nick_lower in nicks:
-                        info = get_report_nick_info(n, nick_lower)
-                        if info is None:
-                            continue
-                        nick, vk_id, current_status = info
-                        if current_status == "отгул":
-                            results[nick_lower] = "отгул"
-                        else:
-                            results[nick_lower] = "есть отчет"
-                    state["results"] = results
-                    state["stage"] = "waiting_results"
-                    PAGE_STATE[peer_id_s] = state
-                    # Отправляем результаты подключённому юзеру
-                    res_lines = []
-                    for nick_lower in nicks:
-                        status = results.get(nick_lower, "нету отчета")
-                        res_lines.append(nick_lower + " " + status)
-                    send_to_page(from_id, "\n".join(res_lines))
-                    return
-            # Этап: ожидает подтверждение "ники получены"
-            elif stage == "waiting_confirm":
-                handle_page_confirm_reply(page_user_id, text)
-                return
-            # Этап: ожидает результаты отчётов
-            elif stage == "waiting_results":
-                if handle_page_results_reply(page_user_id, text):
-                    return
-        # Если юзер подключённый, но нет активного состояния — просто показываем кнопки
         return
 
     # новый пользователь начал с команды — тоже показываем кнопки
