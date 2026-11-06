@@ -17,6 +17,9 @@ jobs:
       VK_TOKEN: ${{ secrets.VK_TOKEN }}
       GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
       GIST_ID: ${{ secrets.GIST_ID }}
+      REPORT_GROUP_ID: ${{ secrets.REPORT_GROUP_ID }}
+      REPORT_TOPIC_ID_OT: ${{ secrets.REPORT_TOPIC_ID_OT }}
+      REPORT_TOPIC_ID_OTCHETY: ${{ secrets.REPORT_TOPIC_ID_OTCHETY }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
