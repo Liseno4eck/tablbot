@@ -1470,50 +1470,38 @@ def cmd_reports_start(date_str, n, peer_id):
     nicks = get_report_nicks(n)
     if not nicks:
         return "Список пуст, проверять нечего."
+    # Собираем ники, у которых реально проверяем отчёт (без отгулов и отпусков)
+    check_list = []
+    for nick_lower in nicks:
+        info = get_report_nick_info(n, nick_lower)
+        if info is None:
+            continue
+        nick, vk_id, cur_status = info
+        if cur_status == "отгул" or cur_status.startswith("отпуск"):
+            continue
+        check_list.append(nick)
     # Сохраняем состояние
     PAGE_STATE[peer_id] = {
-        "stage": "waiting_list",
+        "stage": "waiting_results",
         "n": n,
         "date": date_str,
         "target_date": target_date,
-        "nicks": nicks,
+        "nicks": [x.lower() for x in check_list],
+        "nick_titles": check_list,
         "peer_id": peer_id,
         "user_id": user_id,
     }
-    # Пишем страничному юзер-боту в ЛС
-    cmd = "/от" if n == 2 else "/отчеты"
-    send_to_page(user_id, cmd + " " + date_str)
+    if not check_list:
+        del PAGE_STATE[peer_id]
+        send_to_page(user_id, "Никто не требует проверки отчетов (все в отпуске или отгуле).")
+        return "Никто не требует проверки — все в отпуске или отгуле."
+    # Отправляем юзеру список ников для проверки
+    send_to_page(
+        user_id,
+        "Проверь отчеты за " + date_str + " для:\n" + "\n".join(check_list)
+        + "\n\nОтветь списком, по одному нику на строку:\nNick_Name есть отчет N скринов\nNick_Name нет отчета"
+    )
     return "✅ Проверка отчётов запущена для " + date_str + " (" + ("списка /нлист" if n == 2 else "списка /список") + ")."
-def handle_page_nicks_reply(user_id, text):
-    """Обрабатывает ответ страничного бота со списком ников."""
-    for peer_id, state in list(PAGE_STATE.items()):
-        if state.get("user_id") != user_id or state.get("stage") != "waiting_nicks":
-            continue
-        # Парсим ники
-        raw = text.strip()
-        nicks = []
-        for part in raw.split():
-            part = part.strip().rstrip(",;:")
-            if part and not part.isdigit() and not part.startswith("/"):
-                nicks.append(part.lower())
-        if not nicks:
-            nicks = [raw.lower()]
-        state["nicks"] = nicks
-        state["stage"] = "waiting_confirm"
-        PAGE_STATE[peer_id] = state
-        # Ответ страничному боту
-        send_to_page(user_id, "ники получены, проверяю отчеты")
-        return True
-    return False
-def handle_page_confirm_reply(user_id, text):
-    """Обрабатывает подтверждение от страничного бота о получении ников."""
-    for peer_id, state in list(PAGE_STATE.items()):
-        if state.get("user_id") != user_id or state.get("stage") != "waiting_confirm":
-            continue
-        state["stage"] = "waiting_results"
-        PAGE_STATE[peer_id] = state
-        return True
-    return False
 def handle_page_results_reply(user_id, text):
     """Обрабатывает результаты проверки отчётов от страничного бота."""
     for peer_id, state in list(PAGE_STATE.items()):
@@ -1581,27 +1569,25 @@ def handle_page_results_reply(user_id, text):
         return True
     return False
 def normalize_report_status(status, target_date):
-    """Если в отчёте указана дата вчера, а сдана сегодня — засчитываем за сегодня.
-    Проверка только за target_date."""
-    today = today_local()
-    yesterday = today - timedelta(days=1)
-    # Пробуем найти дату в статусе
+    """Если в отчёте указана дата на день раньше target_date — засчитываем (отчёт сдан сегодня за вчера).
+    Проверка только за target_date и день до него."""
+    if target_date is None:
+        return status
+    # Допустимая дата отчёта = target_date или день раньше (сдан сегодня за вчера)
+    allowed_dates = {target_date, target_date - timedelta(days=1)}
     match = re.search(REPORT_DATE_RE, status)
     if match:
         try:
             found_date = date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
-            if found_date == yesterday and today == target_date:
-                # Отчёт за вчера, сданный сегодня — засчитываем
+            if found_date in allowed_dates:
+                # Отчёт засчитывается за target_date
                 status = re.sub(REPORT_DATE_RE, format_report_date(target_date), status)
-            elif found_date != target_date:
+            else:
                 # Не за этот день — не засчитываем
                 return "нету отчета (дата " + match.group(0) + " не за " + format_report_date(target_date) + ")"
         except ValueError:
             pass
     return status
-def check_report_date_only(target_date):
-    """Проверяем что отчёт только за target_date, не за другой день."""
-    return target_date == today_local() or target_date == today_local() - timedelta(days=1)
 # ==========================================================
 # ОТЧЁТЫ: где проверять (сообщество + обсуждения)
 # ==========================================================
@@ -2715,51 +2701,22 @@ def process_event(event):
         return
 
     # ======================================================
-    # ОТЧЁТЫ: обработка сообщений от подключённого юзера
-    # (идёт ДО диалога отпуска — иначе "ники получены" без слэша
-    #  перехватывался бы блоком отпуска)
+    # ОТЧЁТЫ: обработка результатов проверки от подключённого юзера
     # ======================================================
     if is_dm and is_page_connected() and from_id == get_page_user_id():
         page_user_id = get_page_user_id()
-        cmd_head = text.strip().split(maxsplit=1)[0].lower() if text.strip() else ""
-        lower_text = text.lower()
         # Ищем активное состояние отчёта для этого пользователя
         for peer_id_s, state in list(PAGE_STATE.items()):
             if state.get("user_id") != page_user_id:
                 continue
             stage = state.get("stage", "")
-            # Этап 1: юзер должен сам запросить список ников
-            if stage == "waiting_list":
-                if cmd_head in ("/нлист", "/список", "/nlist"):
-                    n = state.get("n", 2)
-                    with lock:
-                        players = list(P(n).values())
-                    nick_list = []
-                    for p in players:
-                        info = get_report_nick_info(n, p["nick"].lower())
-                        if info is None:
-                            continue
-                        nick, vk_id, cur_status = info
-                        # отгул и отпуск в список не отдаём — их отчёт не проверяется
-                        if cur_status == "отгул" or cur_status.startswith("отпуск"):
-                            continue
-                        nick_list.append(nick)
-                    if not nick_list:
-                        send_to_page(from_id, "Список пуст.")
-                        del PAGE_STATE[peer_id_s]
-                        return
-                    send_to_page(from_id, " ".join(nick_list))
-                    state["nicks"] = [x.lower() for x in nick_list]
-                    state["nick_titles"] = nick_list
-                    state["stage"] = "waiting_results"
-                    PAGE_STATE[peer_id_s] = state
-                    return
-                return
-            # Этап 2: ждём результаты проверки
+            # Ждём результаты проверки от юзера
             if stage == "waiting_results":
-                # «ники/списки получены, проверяю отчеты» — просто подтверждение, ждём дальше
+                # «ники получены, проверяю отчеты» — это не результат, а просто подтверждение
+                lower_text = text.lower()
                 if "получены" in lower_text or "проверяю" in lower_text:
                     return
+                # Парсим результаты и отправляем в чат
                 if handle_page_results_reply(page_user_id, text):
                     return
                 return
