@@ -52,6 +52,30 @@ SHOP_PER_PAGE = 6
 PURCHASE_HISTORY_LIMIT = 200
 # Папка для шрифтов (для картинки-справки)
 FONT_DIR = os.environ.get("FONT_DIR", "fonts")
+# ==========================================================
+# СТРАНИЧНЫЙ БОТ (второй токен от «Маруси»)
+# ==========================================================
+PAGE_TOKEN = None        # токен страничного бота
+PAGE_GROUP_ID = None     # ID группы, к которой подключён страничный бот
+PAGE_USER_ID = None      # VK ID пользователя, который подключил бота
+PAGE_VK = None           # VkApi-сессия для второго токена
+PAGE_LONGPOLL = None     # VkBotLongPoll для второго токена
+PAGE_READY = False       # флаг: страничный бот подключён и готов
+PAGE_STATE = {}          # peer_id -> {"stage": "...", "data": {...}}
+PAGE_NICKS = {}          # peer_id -> [nick1, nick2, ...]
+PAGE_REPORTS = {}        # peer_id -> {"дд.мм.гггг": {nick: "есть отчет N скринов"}}
+PAGE_NICKS_GIST = "nicks_reports.json"
+NICKS_GIST_ENABLED = bool(GIST_TOKEN and GIST_ID)
+# ==========================================================
+# ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
+# ==========================================================
+# ID сообщества, в котором игроки скидывают отчёты.
+REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "0") or 0)
+# Обсуждение, где проверяются отчёты для /от  (список /нлист)
+REPORT_TOPIC_ID_OT = int(os.environ.get("REPORT_TOPIC_ID_OT", "0") or 0)
+# Обсуждение, где проверяются отчёты для /отчеты  (список /список)
+REPORT_TOPIC_ID_OTCHETY = int(os.environ.get("REPORT_TOPIC_ID_OTCHETY", "0") or 0)
+# ==========================================================
 def _clean_gist_id(value):
     value = (value or "").strip()
     match = re.search(r"gist\.github\.com/(?:[^/]+/)?([0-9a-fA-F]+)", value)
@@ -91,6 +115,14 @@ data = {
     "nplayers": {}, "nshop": [], "nadmins": [],
     "contacts": [],
     "purchase_counter": 0,
+    # секретное подключение страничного бота
+    "page": {"token": "", "user_id": 0, "group_id": 0},
+    # где проверять отчёты (переопределяет REPORT_* из шапки)
+    "report_settings": {"group_id": 0, "topic_ot": 0, "topic_otchety": 0},
+    # отчёты: "дд.мм.гггг" -> {list_type: {nick: статус}}
+    "reports": {},
+    # ники для отчётов (складываются в Gist)
+    "report_nicks": {},
 }
 CONTACTS = set()
 LAST_BUY = {}
@@ -181,6 +213,69 @@ def gist_save(payload, attempts=4):
             if attempt < attempts:
                 time.sleep(delays[min(attempt - 1, len(delays) - 1)])
     return False
+# ==========================================================
+# GIST: отчёты и ники (отдельный файл)
+# ==========================================================
+NICKS_GIST_FILENAME = "nicks_reports.json"
+def _gist_request_nicks(method, url, body=None):
+    headers = {
+        "Authorization": "Bearer " + GIST_TOKEN,
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "vk-points-bot",
+    }
+    raw = None
+    if body is not None:
+        raw = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=raw, headers=headers, method=method)
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        return resp.read().decode("utf-8")
+def gist_nicks_load():
+    """Загружает данные отчётов из Gist (отдельный файл)."""
+    if not NICKS_GIST_ENABLED:
+        return {}
+    try:
+        text = _gist_request_nicks("GET", "https://api.github.com/gists/" + GIST_ID)
+        info = json.loads(text)
+        files = info.get("files") or {}
+        file_info = files.get(NICKS_GIST_FILENAME)
+        if file_info is None:
+            return {}
+        content = file_info.get("content") or ""
+        if file_info.get("truncated") and file_info.get("raw_url"):
+            req = urllib.request.Request(
+                file_info["raw_url"],
+                headers={"Authorization": "Bearer " + GIST_TOKEN, "User-Agent": "vk-points-bot"},
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                content = resp.read().decode("utf-8")
+        content = content.strip()
+        if not content:
+            return {}
+        parsed = json.loads(content)
+        if not isinstance(parsed, dict):
+            raise ValueError("содержимое nicks_reports.json должно быть JSON-объектом")
+        return parsed
+    except Exception as e:
+        print("Не удалось загрузить отчёты из Gist:", repr(e))
+        return {}
+def gist_nicks_save(data_to_save):
+    """Сохраняет данные отчётов в Gist (отдельный файл)."""
+    if not NICKS_GIST_ENABLED:
+        return True
+    try:
+        payload = json.dumps(data_to_save, ensure_ascii=False, indent=2)
+        _gist_request_nicks(
+            "PATCH",
+            "https://api.github.com/gists/" + GIST_ID,
+            {"files": {NICKS_GIST_FILENAME: {"content": payload}}},
+        )
+        print("Данные отчётов сохранены в Gist.")
+        return True
+    except Exception as e:
+        print("Ошибка сохранения отчётов в Gist:", repr(e))
+        return False
 def _save_local(payload):
     tmp = DATA_FILE + ".tmp"
     try:
@@ -327,6 +422,60 @@ def _norm_ids(raw_ids):
             except (TypeError, ValueError):
                 pass
     return ids
+def _norm_page(raw_page):
+    """Нормализует сохранённое секретное подключение страничного бота."""
+    raw_page = raw_page if isinstance(raw_page, dict) else {}
+    token = str(raw_page.get("token") or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_\-]{10,256}", token):
+        token = ""
+    try:
+        user_id = int(raw_page.get("user_id") or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+    try:
+        group_id = int(raw_page.get("group_id") or 0)
+    except (TypeError, ValueError):
+        group_id = 0
+    return {"token": token, "user_id": user_id if user_id > 0 else 0,
+            "group_id": group_id if group_id > 0 else 0}
+def _norm_reports(raw_reports):
+    """"дд.мм.гггг" -> {"1": {nick: "есть отчет N скринов"/"нету отчета"/"отгул"}, "2": {...}}"""
+    result = {}
+    if not isinstance(raw_reports, dict):
+        return result
+    for day, lists in raw_reports.items():
+        day = str(day).strip()
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", day) or not isinstance(lists, dict):
+            continue
+        entry = {}
+        for key in ("1", "2"):
+            block = lists.get(key)
+            if not isinstance(block, dict):
+                continue
+            nick_map = {}
+            for nick, status in block.items():
+                nick = str(nick).strip()
+                if nick:
+                    nick_map[nick] = str(status).strip()
+            if nick_map:
+                entry[key] = nick_map
+        if entry:
+            result[day] = entry
+    return result
+def _norm_report_settings(raw):
+    """Настройки «где проверять отчёты»: group_id, topic_ot, topic_otchety."""
+    raw = raw if isinstance(raw, dict) else {}
+    def _pid(value, fallback):
+        try:
+            value = int(value or 0)
+        except (TypeError, ValueError):
+            return fallback
+        return value if value > 0 else fallback
+    return {
+        "group_id": _pid(raw.get("group_id"), REPORT_GROUP_ID),
+        "topic_ot": _pid(raw.get("topic_ot"), REPORT_TOPIC_ID_OT),
+        "topic_otchety": _pid(raw.get("topic_otchety"), REPORT_TOPIC_ID_OTCHETY),
+    }
 def _assign_purchase_ids(players1, players2, counter):
     """Старым покупкам без номера выдаёт номера (по времени). Возвращает новый счётчик."""
     all_purchases = []
@@ -359,6 +508,10 @@ def _normalize_loaded(loaded):
         "nadmins": _norm_ids(loaded.get("nadmins")),
         "contacts": list(dict.fromkeys(_norm_ids(loaded.get("contacts")))),
         "purchase_counter": counter,
+        "page": _norm_page(loaded.get("page")),
+        "report_settings": _norm_report_settings(loaded.get("report_settings")),
+        "reports": _norm_reports(loaded.get("reports")),
+        "report_nicks": _norm_reports(loaded.get("report_nicks")),
     }
 def load_data():
     local = _read_local()
@@ -394,6 +547,10 @@ def load_data():
     for key in DATA_KEYS:
         data[key] = normalized[key]
     data["purchase_counter"] = normalized["purchase_counter"]
+    data["page"] = normalized["page"]
+    data["report_settings"] = normalized["report_settings"]
+    data["reports"] = normalized["reports"]
+    data["report_nicks"] = normalized["report_nicks"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -401,6 +558,18 @@ def load_data():
     NADMIN_IDS.update(data["nadmins"])
     CONTACTS.clear()
     CONTACTS.update(data["contacts"])
+    # Восстанавливаем страничный бот из сохранённых данных
+    page = data.get("page", {})
+    if page.get("token"):
+        global PAGE_TOKEN, PAGE_VK, PAGE_GROUP_ID, PAGE_READY
+        PAGE_TOKEN = page.get("token")
+        PAGE_GROUP_ID = page.get("group_id")
+        PAGE_READY = True
+        try:
+            PAGE_VK = vk_api.VkApi(token=PAGE_TOKEN)
+            print("Страничный бот восстановлен из файла: user=" + str(page.get("user_id")) + " group=" + str(PAGE_GROUP_ID))
+        except Exception as e:
+            print("Не удалось восстановить страничный бот:", repr(e))
     if need_push:
         if not save_data():
             raise SystemExit("Не удалось записать начальные данные в Gist. Бот остановлен.")
@@ -552,6 +721,57 @@ def notify_rollback(n, text, exclude_id):
     """Сообщение об откате всем админам (кроме того, кто откатил).
     Для покупок из /нлист — ещё и админам /вдв."""
     executor.submit(_notify_rollback_worker, n, text, exclude_id)
+# ==========================================================
+# СТРАНИЧНЫЙ БОТ: отправка / получение
+# ==========================================================
+def _get_page_vk():
+    """Возвращает VkApi-сессию для страничного бота (создаёт, если нужно)."""
+    global PAGE_VK, PAGE_TOKEN, PAGE_GROUP_ID
+    page = data.get("page", {})
+    token = page.get("token", "")
+    group_id = page.get("group_id", 0)
+    if token and token != PAGE_TOKEN:
+        PAGE_TOKEN = token
+        PAGE_VK = vk_api.VkApi(token=token)
+        PAGE_GROUP_ID = group_id
+    elif token and PAGE_VK is None:
+        PAGE_VK = vk_api.VkApi(token=token)
+        PAGE_GROUP_ID = group_id
+    return PAGE_VK
+def send_to_page(user_id, text, keyboard=None):
+    """Отправляет сообщение подключённому страничному боту (через основной токен)."""
+    try:
+        params = {"user_id": user_id, "message": str(text), "random_id": get_random_id()}
+        if keyboard:
+            params["keyboard"] = keyboard
+        vk.messages.send(**params)
+    except Exception as e:
+        print("Ошибка отправки страничному боту:", repr(e))
+def send_page_message(user_id, text, keyboard=None):
+    """Отправляет сообщение от страничного бота (через второй токен)."""
+    p_vk = _get_page_vk()
+    if p_vk is None:
+        print("Страничный бот не подключён.")
+        return False
+    try:
+        params = {"user_id": user_id, "message": str(text), "random_id": get_random_id()}
+        if keyboard:
+            params["keyboard"] = keyboard
+        p_vk.messages.send(**params)
+        return True
+    except Exception as e:
+        print("Ошибка отправки от страничного бота:", repr(e))
+        return False
+def is_page_connected():
+    """Проверяет, подключён ли страничный бот."""
+    page = data.get("page", {})
+    token = page.get("token", "")
+    user_id = page.get("user_id", 0)
+    return bool(token) and bool(user_id)
+def get_page_user_id():
+    """Возвращает VK ID пользователя, подключившего страничный бот."""
+    page = data.get("page", {})
+    return page.get("user_id", 0)
 # ==========================================================
 # ОПРЕДЕЛЕНИЕ VK ID
 # ==========================================================
@@ -1069,6 +1289,306 @@ def cmd_reply_to_user(msg, from_id, text):
         return "❌ Не удалось отправить ответ пользователю."
     return "✅ Ответ отправлен [id" + str(target_id) + "|пользователю]."
 # ==========================================================
+# ОТЧЁТЫ: /от дд.мм.гггг  и  /отчеты дд.мм.гггг
+# ==========================================================
+REPORT_DATE_RE = r"(\d{2})\.(\d{2})\.(\d{4})"
+def parse_report_date(text):
+    """'дд.мм.гггг' -> date. Возвращает datetime.date или None."""
+    match = re.fullmatch(REPORT_DATE_RE, text.strip())
+    if not match:
+        return None
+    try:
+        return date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+    except ValueError:
+        return None
+def format_report_date(d):
+    return d.strftime("%d.%m.%Y")
+def get_report_nicks(n):
+    """Список ников из P(n)."""
+    with lock:
+        return list(P(n).keys())
+def get_report_nick_info(n, nick_lower):
+    """Возвращает (nick, vk_id, status) для ника."""
+    p = P(n).get(nick_lower)
+    if p is None:
+        return None
+    with lock:
+        vacation = p.get("vacation")
+        otgul = p.get("otgul", 0)
+        if vacation:
+            status = "отпуск до " + str(vacation)
+        elif otgul:
+            status = "отгул"
+        else:
+            status = "работает"
+        return p["nick"], p["vk_id"], status
+def cmd_report_connect(user_id, token, group_id):
+    """Команда +токен: подключить страничный бот."""
+    global PAGE_TOKEN, PAGE_VK, PAGE_GROUP_ID, PAGE_READY
+    if not token or not re.fullmatch(r"[A-Za-z0-9_\-]{10,256}", token):
+        return "❌ Токен некорректный."
+    if group_id and not re.fullmatch(r"\d+", group_id):
+        return "❌ ID группы некорректный."
+    gid = int(group_id) if group_id else GROUP_ID
+    try:
+        test_vk = vk_api.VkApi(token=token)
+        test_api = test_vk.get_api()
+        groups = test_api.groups.get(group_id=gid)
+        if not groups.get("items"):
+            return "❌ Не удалось подключиться к группе " + str(gid) + " с этим токеном."
+    except Exception as e:
+        return "❌ Не удалось подключиться: " + str(e)
+    with lock:
+        data["page"] = {"token": token, "user_id": user_id, "group_id": gid}
+        save_data()
+    PAGE_TOKEN = token
+    PAGE_VK = test_vk
+    PAGE_GROUP_ID = gid
+    PAGE_READY = True
+    return "✅ Страничный бот подключён. Токен сохранён, ID: " + str(gid) + "."
+def cmd_report_disconnect(user_id):
+    """Команда -токен: отключить страничный бот."""
+    global PAGE_TOKEN, PAGE_VK, PAGE_GROUP_ID, PAGE_READY
+    with lock:
+        if not data.get("page", {}).get("token"):
+            return "Страничный бот не подключён."
+        data["page"] = {"token": "", "user_id": 0, "group_id": 0}
+        save_data()
+    PAGE_TOKEN = None
+    PAGE_VK = None
+    PAGE_GROUP_ID = None
+    PAGE_READY = False
+    return "✅ Страничный бот отключён."
+def cmd_reports_start(date_str, n, peer_id):
+    """Начать проверку отчётов. n=1 для /отчеты, n=2 для /от."""
+    if not is_page_connected():
+        return "❌ Страничный бот не подключён. Напишите +токен <токен>."
+    target_date = parse_report_date(date_str)
+    if target_date is None:
+        return "Формат: " + ("/отчеты дд.мм.гггг" if n == 1 else "/от дд.мм.гггг")
+    user_id = get_page_user_id()
+    if not user_id:
+        return "❌ Не удалось определить ID пользователя страничного бота."
+    nicks = get_report_nicks(n)
+    if not nicks:
+        return "Список пуст, проверять нечего."
+    # Сохраняем состояние
+    PAGE_STATE[peer_id] = {
+        "stage": "waiting_nicks",
+        "n": n,
+        "date": date_str,
+        "target_date": target_date,
+        "nicks": nicks,
+        "peer_id": peer_id,
+        "user_id": user_id,
+    }
+    # Пишем страничному юзер-боту в ЛС
+    cmd = "/от" if n == 2 else "/отчеты"
+    send_to_page(user_id, cmd + " " + date_str)
+    return "✅ Проверка отчётов запущена для " + date_str + " (" + ("списка /нлист" if n == 2 else "списка /список") + ")."
+def handle_page_nicks_reply(user_id, text):
+    """Обрабатывает ответ страничного бота со списком ников."""
+    for peer_id, state in list(PAGE_STATE.items()):
+        if state.get("user_id") != user_id or state.get("stage") != "waiting_nicks":
+            continue
+        # Парсим ники
+        raw = text.strip()
+        nicks = []
+        for part in raw.split():
+            part = part.strip().rstrip(",;:")
+            if part and not part.isdigit() and not part.startswith("/"):
+                nicks.append(part.lower())
+        if not nicks:
+            nicks = [raw.lower()]
+        state["nicks"] = nicks
+        state["stage"] = "waiting_confirm"
+        PAGE_STATE[peer_id] = state
+        # Ответ страничному боту
+        send_page_message(user_id, "ники получены, проверяю отчеты")
+        return True
+    return False
+def handle_page_confirm_reply(user_id, text):
+    """Обрабатывает подтверждение от страничного бота о получении ников."""
+    for peer_id, state in list(PAGE_STATE.items()):
+        if state.get("user_id") != user_id or state.get("stage") != "waiting_confirm":
+            continue
+        state["stage"] = "waiting_results"
+        PAGE_STATE[peer_id] = state
+        return True
+    return False
+def handle_page_results_reply(user_id, text):
+    """Обрабатывает результаты проверки отчётов от страничного бота."""
+    for peer_id, state in list(PAGE_STATE.items()):
+        if state.get("user_id") != user_id or state.get("stage") != "waiting_results":
+            continue
+        # Парсим результаты: "nick_name есть отчет n скринов"
+        results = {}
+        lines = text.strip().splitlines()
+        for line in lines:
+            line = line.strip().lower()
+            parts = line.split()
+            if not parts:
+                continue
+            nick = parts[0]
+            status = " ".join(parts[1:]) if len(parts) > 1 else "есть отчет"
+            results[nick] = status
+        state["results"] = results
+        state["stage"] = "done"
+        PAGE_STATE[peer_id] = state
+        # Отправляем в чат где была введена команда
+        n = state.get("n", 2)
+        date_str = state.get("date", "")
+        target_date = state.get("target_date")
+        nicks = state.get("nicks", [])
+        # Формируем итоговое сообщение
+        lines = ["📋 Отчёты за " + date_str + ":"]
+        saved_reports = {}
+        for nick_lower in nicks:
+            info = get_report_nick_info(n, nick_lower)
+            if info is None:
+                continue
+            nick, vk_id, current_status = info
+            if current_status == "отгул":
+                lines.append(nick + " — отгул")
+                saved_reports[nick] = "отгул"
+                continue
+            status = results.get(nick_lower, "нету отчета")
+            if "есть" in status:
+                # Проверяем дату в отчёте: если указана вчерашняя, а сдана сегодня — засчитываем за сегодня
+                status = normalize_report_status(status, target_date)
+                lines.append(nick + " — " + status)
+                saved_reports[nick] = status
+            else:
+                lines.append(nick + " — " + status)
+                saved_reports[nick] = status
+        # Сохраняем в Gist
+        with lock:
+            day_key = format_report_date(target_date) if target_date else date_str
+            if "reports" not in data:
+                data["reports"] = {}
+            data["reports"][day_key] = saved_reports
+            # Добавляем ники
+            if "report_nicks" not in data:
+                data["report_nicks"] = {}
+            if day_key not in data["report_nicks"]:
+                data["report_nicks"][day_key] = {}
+            data["report_nicks"][day_key][str(n)] = {nk: nk for nk in nicks}
+            save_data()
+        # Отправляем в чат
+        reply(peer_id, "\n".join(lines))
+        # Отправляем страничному боту "все выше отчеты проверены"
+        send_page_message(user_id, "все выше отчеты проверены")
+        # Удаляем состояние
+        del PAGE_STATE[peer_id]
+        return True
+    return False
+def normalize_report_status(status, target_date):
+    """Если в отчёте указана дата вчера, а сдана сегодня — засчитываем за сегодня.
+    Проверка только за target_date."""
+    today = today_local()
+    yesterday = today - timedelta(days=1)
+    # Пробуем найти дату в статусе
+    match = re.search(REPORT_DATE_RE, status)
+    if match:
+        try:
+            found_date = date(int(match.group(3)), int(match.group(2)), int(match.group(1)))
+            if found_date == yesterday and today == target_date:
+                # Отчёт за вчера, сданный сегодня — засчитываем
+                status = re.sub(REPORT_DATE_RE, format_report_date(target_date), status)
+            elif found_date != target_date:
+                # Не за этот день — не засчитываем
+                return "нету отчета (дата " + match.group(0) + " не за " + format_report_date(target_date) + ")"
+        except ValueError:
+            pass
+    return status
+def check_report_date_only(target_date):
+    """Проверяем что отчёт только за target_date, не за другой день."""
+    return target_date == today_local() or target_date == today_local() - timedelta(days=1)
+# ==========================================================
+# ОТЧЁТЫ: где проверять (сообщество + обсуждения)
+# ==========================================================
+def get_report_settings():
+    """Актуальные настройки места проверки отчётов: сохранённые или из шапки файла."""
+    with lock:
+        saved = data.get("report_settings") or {}
+    return _norm_report_settings(saved)
+def topic_id_for_list(n):
+    """Какой топик использовать: n=1 -> /отчеты, n=2 -> /от."""
+    st = get_report_settings()
+    return st["topic_otchety"] if n == 1 else st["topic_ot"]
+def settings_warning(n):
+    """Подсказка, если не задано сообщество или обсуждение."""
+    st = get_report_settings()
+    missing = []
+    if not st["group_id"]:
+        missing.append("сообщество (/отгруппа <id>)")
+    if not topic_id_for_list(n):
+        missing.append("обсуждение (/отобс %s)" % ("отчеты" if n == 1 else "от"))
+    if not missing:
+        return ""
+    return "⚠️ Не задано: " + ", ".join(missing) + ".\n"
+def cmd_report_settings(raw_cmd, args, user_id):
+    """/отгруппа <id> — где лежат отчёты. /отобс от|отчеты <topic_id> — какое обсуждение.
+    /отместо — показать текущие настройки. Только общие админы."""
+    if user_id not in ALLOWED_IDS:
+        return None
+    st = get_report_settings()
+    if raw_cmd == "/отместо":
+        gid = st["group_id"]
+        lines = ["📍 Где бот проверяет отчёты:"]
+        lines.append("Сообщество: " + (str(gid) + " (vk.com/club" + str(gid) + ")" if gid else "не задано"))
+        lines.append("Обсуждение для /от (список /нлист): " + (str(st["topic_ot"]) if st["topic_ot"] else "не задано"))
+        lines.append("Обсуждение для /отчеты (список /список): " + (str(st["topic_otchety"]) if st["topic_otchety"] else "не задано"))
+        lines.append(
+            "\nЗадать:\n"
+            "/отгруппа 123456\n"
+            "/отобс от 1 — обсуждение для /от\n"
+            "/отобс отчеты 2 — обсуждение для /отчеты"
+        )
+        return "\n".join(lines)
+    if raw_cmd == "/отгруппа":
+        if len(args) != 1 or not re.fullmatch(r"-?\d+", args[0]):
+            return "Формат: /отгруппа 123456"
+        gid = abs(int(args[0]))
+        if gid <= 0:
+            return "ID сообщества должен быть больше 0."
+        try:
+            vk.messages.send(
+                peer_id=2000000000 + gid,
+                message=".",
+                random_id=get_random_id(),
+            )
+        except Exception:
+            pass  # проверка не критична: сообщество может не принимать сообщения бота
+        with lock:
+            data["report_settings"] = {**st, "group_id": gid}
+            save_data()
+        return "✅ Сообщество для проверки отчётов: " + str(gid) + " (vk.com/club" + str(gid) + ")."
+    if raw_cmd == "/отобс":
+        if len(args) != 2 or not re.fullmatch(r"-?\d+", args[1]):
+            return (
+                "Формат: /отобс от 1\n"
+                "/отобс от — обсуждение для команды /от (список /нлист)\n"
+                "/отобс отчеты — обсуждение для /отчеты (список /список)"
+            )
+        which = args[0].lower()
+        tid = abs(int(args[1]))
+        if tid <= 0:
+            return "ID обсуждения должен быть больше 0."
+        if which in ("от", "ot", "2"):
+            key = "topic_ot"
+            title = "/от (список /нлист)"
+        elif which in ("отчеты", "отчёты", "otchety", "1"):
+            key = "topic_otchety"
+            title = "/отчеты (список /список)"
+        else:
+            return "Укажите: /отобс от <id> или /отобс отчеты <id>"
+        with lock:
+            data["report_settings"] = {**st, key: tid}
+            save_data()
+        return "✅ Обсуждение для " + title + ": " + str(tid) + "."
+    return None
+# ==========================================================
 # БАЛЛЫ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ
 # ==========================================================
 def cmd_points(user_id, n):
@@ -1514,6 +2034,13 @@ ADMIN_HELP = (
     "/снятьвд @username — забрать доступ админа\n"
     "/вдв @username — выдать доступ только к списку /нлист\n"
     "/снятьвдв @username — забрать доступ к /нлист\n\n"
+    "Отчёты (нужен подключённый страничный бот + настройки места проверки):\n"
+    "/отместо — показать где проверяются отчёты\n"
+    "/отгруппа 123456 — ID сообщества, где лежат отчёты\n"
+    "/отобс от 1 — обсуждение для /от\n"
+    "/отобс отчеты 2 — обсуждение для /отчеты\n"
+    "/отчеты дд.мм.гггг — проверка отчётов для /список (общие админы)\n"
+    "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n\n"
     "Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин. "
     "После покупки бот спросит дату и «включительно да/нет», затем уведомит админов. "
     "Время считается по МСК."
@@ -1534,7 +2061,10 @@ NADMIN_HELP = (
     "/изменить Старый Новый — сменить ник\n"
     "/разослать текст — рассылка привязанным игрокам\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
-    "/-магазин 3 — удалить товар из магазина по номеру"
+    "/-магазин 3 — удалить товар из магазина по номеру\n\n"
+    "Отчёты (нужен подключённый страничный бот):\n"
+    "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
+    "/отместо — показать где проверяются отчёты\n"
 )
 def cmd_help(user_id):
     if user_id in ALLOWED_IDS:
@@ -1572,6 +2102,13 @@ ADMIN_SECTIONS = [
         ("/рассылка текст", "Всем, кто писал боту"),
         ("/ответить текст", "Ответ на обращение (reply)"),
     ]),
+    ("Отчёты", [
+        ("/отчеты дд.мм.гггг", "Проверка отчётов /список"),
+        ("/от дд.мм.гггг", "Проверка отчётов /нлист"),
+        ("/отгруппа 123456", "Сообщество с отчётами"),
+        ("/отобс от 1  ·  /отобс отчеты 2", "Обсуждения для проверки"),
+        ("/отместо", "Где сейчас проверяются отчёты"),
+    ]),
     ("Доступ", [
         ("/вд @юз", "Полный доступ админа"),
         ("/снятьвд @юз", "Забрать полный доступ"),
@@ -1601,6 +2138,10 @@ NADMIN_SECTIONS = [
     ("Покупки", [
         ("/откат 5", "Откатить покупку №5"),
         ("/откат 5 вернуть", "Откатить и вернуть баллы"),
+    ]),
+    ("Отчёты", [
+        ("/от дд.мм.гггг", "Проверка отчётов /нлист"),
+        ("/отместо", "Где сейчас проверяются отчёты"),
     ]),
     ("Рассылка", [
         ("/разослать текст", "Всем игрокам /нлист"),
@@ -1901,7 +2442,7 @@ def auto_ctx(command, args):
 # ==========================================================
 # ОБРАБОТКА АДМИНСКИХ КОМАНД
 # ==========================================================
-def handle(text, user_id):
+def handle(text, user_id, peer_id=0):
     parts = text.strip().split()
     if not parts:
         return None
@@ -1932,6 +2473,39 @@ def handle(text, user_id):
     # Рассылка всем, кто писал боту — только общие админы
     if raw_cmd == "/рассылка":
         return cmd_broadcast_all(text) if is_common else None
+
+    # Отчёты — общие админы: /отчеты дд.мм.гггг, /вдв админы: /от дд.мм.гггг
+    if raw_cmd == "/отчеты":
+        if not is_common:
+            return None
+        if len(args) != 1:
+            return "Формат: /отчеты дд.мм.гггг"
+        warn = settings_warning(1)
+        if warn:
+            return warn
+        return cmd_reports_start(args[0], 1, peer_id)
+    if raw_cmd == "/от":
+        if not is_nadmin and not is_common:
+            return None
+        if len(args) != 1:
+            return "Формат: /от дд.мм.гггг"
+        warn = settings_warning(2)
+        if warn:
+            return warn
+        return cmd_reports_start(args[0], 2, peer_id)
+
+    # Настройки «где проверять отчёты» — только общие админы
+    if raw_cmd == "/отместо":
+        return cmd_report_settings(raw_cmd, args, user_id)
+    if raw_cmd == "/отгруппа":
+        return cmd_report_settings(raw_cmd, args, user_id)
+    if raw_cmd == "/отобс":
+        return cmd_report_settings(raw_cmd, args, user_id)
+
+    # Секретная команда +токен (обработана выше в process_event для всех в ЛС)
+    if raw_cmd == "+токен":
+        return None
+    return None
 
     command, suffix = split_command(raw_cmd)
     if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
@@ -2040,6 +2614,18 @@ def process_event(event):
         reply(peer_id, WELCOME_TEXT if is_new else MENU_TEXT, menu_keyboard())
         return
 
+    # === Секретная команда +токен (любой, в ЛС; в /help не светится) ===
+    if text.startswith("+токен"):
+        parts = text.strip().split()
+        if len(parts) < 2:
+            reply(peer_id, "Формат: +токен <токен> <id_группы>")
+            return
+        token = parts[1]
+        gid = parts[2] if len(parts) > 2 else str(GROUP_ID)
+        answer = cmd_report_connect(from_id, token, gid)
+        reply(peer_id, answer)
+        return
+
     # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
         handled = False
@@ -2055,6 +2641,66 @@ def process_event(event):
         # новый пользователь написал что угодно — сразу показываем кнопки
         if is_dm and is_new and not handled:
             reply(peer_id, WELCOME_TEXT, menu_keyboard())
+        return
+
+    # ======================================================
+    # ОТЧЁТЫ: обработка сообщений от подключённого юзера
+    # ======================================================
+    if is_dm and is_page_connected() and from_id == get_page_user_id():
+        page_user_id = get_page_user_id()
+        # Ищем активное состояние отчёта для этого пользователя
+        for peer_id_s, state in list(PAGE_STATE.items()):
+            if state.get("user_id") != page_user_id:
+                continue
+            stage = state.get("stage", "")
+            # Этап: ожидает /нлист от подключённого юзера
+            if stage == "waiting_nicks":
+                # Если юзер отправил /нлист — отправляем ники
+                if raw_cmd == "/нлист" or raw_cmd == "/список":
+                    n = state.get("n", 2)
+                    nicks = get_report_nicks(n)
+                    if nicks:
+                        send_to_page(from_id, " ".join(nicks))
+                    else:
+                        send_to_page(from_id, "Список пуст.")
+                    return
+                # Если юзер отправил "ники получены..." — запускаем проверку
+                lower_text = text.lower()
+                if "ники получены" in lower_text or "проверяю" in lower_text:
+                    handle_page_confirm_reply(page_user_id, text)
+                    # Проверяем каждый ник и отправляем результаты
+                    n = state.get("n", 2)
+                    nicks = state.get("nicks", [])
+                    target_date = state.get("target_date")
+                    results = {}
+                    for nick_lower in nicks:
+                        info = get_report_nick_info(n, nick_lower)
+                        if info is None:
+                            continue
+                        nick, vk_id, current_status = info
+                        if current_status == "отгул":
+                            results[nick_lower] = "отгул"
+                        else:
+                            results[nick_lower] = "есть отчет"
+                    state["results"] = results
+                    state["stage"] = "waiting_results"
+                    PAGE_STATE[peer_id_s] = state
+                    # Отправляем результаты подключённому юзеру
+                    res_lines = []
+                    for nick_lower in nicks:
+                        status = results.get(nick_lower, "нету отчета")
+                        res_lines.append(nick_lower + " " + status)
+                    send_to_page(from_id, "\n".join(res_lines))
+                    return
+            # Этап: ожидает подтверждение "ники получены"
+            elif stage == "waiting_confirm":
+                handle_page_confirm_reply(page_user_id, text)
+                return
+            # Этап: ожидает результаты отчётов
+            elif stage == "waiting_results":
+                if handle_page_results_reply(page_user_id, text):
+                    return
+        # Если юзер подключённый, но нет активного состояния — просто показываем кнопки
         return
 
     # новый пользователь начал с команды — тоже показываем кнопки
@@ -2115,7 +2761,7 @@ def process_event(event):
     if from_id not in ALLOWED_IDS and from_id not in NADMIN_IDS:
         return
     try:
-        answer = handle(text, from_id)
+        answer = handle(text, from_id, peer_id)
     except Exception as e:
         print("Ошибка команды:", repr(e))
         answer = "Произошла ошибка при выполнении команды."
@@ -2154,6 +2800,17 @@ def main():
     )
     print("Владелец обращений (/написать):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
+    page = data.get("page", {})
+    if page.get("token"):
+        print("Страничный бот подключён: user=" + str(page.get("user_id")) + " group=" + str(page.get("group_id")))
+    else:
+        print("Страничный бот не подключён. Для подключения: +токен <токен> <group_id>")
+    rst = get_report_settings()
+    print(
+        "Проверка отчётов — сообщество:", rst["group_id"] or "не задано (/отгруппа)",
+        "| обсуждение /от:", rst["topic_ot"] or "не задано (/отобс от)",
+        "| обсуждение /отчеты:", rst["topic_otchety"] or "не задано (/отобс отчеты)",
+    )
     # заранее рисуем и загружаем картинки-справки, чтобы /help отвечал сразу
     executor.submit(get_help_photo, "admin")
     executor.submit(get_help_photo, "nadmin")
