@@ -1637,6 +1637,150 @@ def finalize_page_results(peer_id, st):
     out = "📋 Отчёты за " + date_str + " (" + LIST_TITLE[n] + "):\n" + ("\n".join(lines) if lines else "пусто")
     reply_long(peer_id, out)
 # ==========================================================
+# /скрины Nick_Name | @username — все скрины игрока за сегодня
+#   1. админ пишет в чате /скрины Nick
+#   2. основной бот пишет страничному боту «/скрины <vk_id> <списки>»
+#   3. страничный бот собирает скрины игрока из обсуждений за сегодня (МСК)
+#      и присылает их основному боту
+#   4. основной бот пересылает их в чат, где была введена команда
+# ==========================================================
+SHOTS_STATE = {}      # peer_id -> состояние запроса
+SHOTS_TIMEOUT = 150
+def cmd_shots(args, user_id, peer_id, is_common):
+    if not is_page_connected():
+        return "❌ Страничный бот не подключён. Напиши в ЛС: +токен vk1.a.XXXXX"
+    if len(args) != 1:
+        return "Формат: /скрины Nick_Name или /скрины @username"
+    page_uid = get_page_user_id()
+    if not page_uid:
+        return "❌ Не удалось определить ID пользователя страничного бота."
+    target = args[0]
+    allowed = (1, 2) if is_common else (2,)
+
+    found = []
+    with lock:
+        for n in allowed:
+            p = find_by_nick(n, target)
+            if p:
+                found.append((n, p))
+    if not found:
+        uid = resolve_user(target)
+        if uid:
+            with lock:
+                for n in allowed:
+                    p = find_by_id(n, uid)
+                    if p:
+                        found.append((n, p))
+    if not found:
+        return "Игрок " + target + " не найден."
+
+    vk_id = found[0][1]["vk_id"]
+    nick = found[0][1]["nick"]
+    lists = [n for n, p in found if p["vk_id"] == vk_id]
+
+    st = get_report_settings()
+    if not st["group_id"]:
+        return "⚠️ Не задано сообщество: /отгруппа <id>."
+    ready = [n for n in lists if (st["topic_otchety"] if n == 1 else st["topic_ot"])]
+    if not ready:
+        return settings_warning(lists[0]) or "Не заданы обсуждения для проверки."
+    lists = ready
+
+    with lock:
+        now = time.time()
+        for key, s in list(SHOTS_STATE.items()):
+            if now - s.get("ts", 0) > SHOTS_TIMEOUT:
+                del SHOTS_STATE[key]
+        if SHOTS_STATE:
+            return "⏳ Сбор скринов уже идёт, подождите."
+        SHOTS_STATE[peer_id] = {
+            "user_id": page_uid, "peer_id": peer_id, "nick": nick,
+            "vk_id": vk_id, "lists": lists, "ts": now, "parts": {}, "total": 0,
+        }
+    if not (PAGE_THREAD and PAGE_THREAD.is_alive()):
+        start_page_bot()
+        time.sleep(3)
+    if not send_to_page(page_uid, "/скрины " + str(vk_id) + " " + ",".join(str(x) for x in lists)):
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+        return "❌ Не удалось написать страничному боту."
+    return "🔎 Ищу скрины " + nick + " за сегодня, ждите..."
+def _extract_attachments(msg):
+    """Достаёт attachment-строки (фото и картинки-документы) из входящего сообщения."""
+    result = []
+    for a in msg.get("attachments") or []:
+        t = a.get("type")
+        if t == "photo":
+            ph = a.get("photo") or {}
+            s = "photo" + str(ph.get("owner_id")) + "_" + str(ph.get("id"))
+            if ph.get("access_key"):
+                s += "_" + str(ph["access_key"])
+            result.append(s)
+        elif t == "doc":
+            dc = a.get("doc") or {}
+            s = "doc" + str(dc.get("owner_id")) + "_" + str(dc.get("id"))
+            if dc.get("access_key"):
+                s += "_" + str(dc["access_key"])
+            result.append(s)
+    return result
+def handle_page_shots(msg):
+    """Сообщение от страничного бота со скринами. True — обработано."""
+    from_id = msg.get("from_id")
+    text = (msg.get("text") or "").strip()
+    with lock:
+        peer_id, st = None, None
+        for peer, s in SHOTS_STATE.items():
+            if s.get("user_id") == from_id:
+                if st is None or s.get("ts", 0) > st.get("ts", 0):
+                    peer_id, st = peer, s
+    if st is None:
+        return False
+    if time.time() - st.get("ts", 0) > SHOTS_TIMEOUT:
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+        return False
+
+    if text.startswith("ОШИБКА"):
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+        reply(peer_id, "❌ Страничный бот: " + text[len("ОШИБКА"):].strip(": \n"))
+        return True
+
+    if text.startswith("СКРИНЫ_НЕТ"):
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+        reply(peer_id, "📭 У " + st["nick"] + " нет скринов за сегодня (" + today_local().strftime("%d.%m.%Y") + ").")
+        return True
+
+    m = re.match(r"СКРИНЫ\s+(\d+)/(\d+)", text)
+    if not m:
+        return False
+    idx, total = int(m.group(1)), int(m.group(2))
+    atts = _extract_attachments(msg)
+    with lock:
+        st["parts"][idx] = atts
+        st["total"] = total
+        st["ts"] = time.time()
+        ready = len(st["parts"]) >= total
+    if ready:
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+        all_atts = []
+        for i in sorted(st["parts"]):
+            all_atts.extend(st["parts"][i])
+        if not all_atts:
+            reply(peer_id, "📭 У " + st["nick"] + " нет скринов за сегодня.")
+            return True
+        header = (
+            "📸 Скрины " + st["nick"] + " за " + today_local().strftime("%d.%m.%Y")
+            + " (" + ", ".join(LIST_TITLE[x] for x in st["lists"]) + "): " + str(len(all_atts))
+        )
+        for i in range(0, len(all_atts), 10):
+            batch = all_atts[i:i + 10]
+            reply(peer_id, header if i == 0 else "…продолжение", attachment=",".join(batch))
+            time.sleep(0.4)
+    return True
+# ==========================================================
 # ОТЧЁТЫ: сторона СТРАНИЧНОГО БОТА (аккаунт пользователя, longpoll по user-токену)
 # ==========================================================
 def stop_page_bot():
@@ -1695,6 +1839,57 @@ def _page_message_text(api, ev):
         print("Страничный бот: getById не удался:", repr(e))
     raw = getattr(ev, "text", "") or ""
     return html_lib.unescape(raw.replace("<br>", "\n"))
+def page_send_att(api, text, attachment):
+    api.messages.send(peer_id=-GROUP_ID, message=text, attachment=attachment, random_id=get_random_id())
+def _comment_attachments(comment):
+    result = []
+    for a in comment.get("attachments") or []:
+        t = a.get("type")
+        if t == "photo":
+            ph = a.get("photo") or {}
+            s = "photo" + str(ph.get("owner_id")) + "_" + str(ph.get("id"))
+            if ph.get("access_key"):
+                s += "_" + str(ph["access_key"])
+            result.append(s)
+        elif t == "doc":
+            dc = a.get("doc") or {}
+            if (dc.get("ext") or "").lower() in ("png", "jpg", "jpeg", "gif", "webp", "bmp"):
+                s = "doc" + str(dc.get("owner_id")) + "_" + str(dc.get("id"))
+                if dc.get("access_key"):
+                    s += "_" + str(dc["access_key"])
+                result.append(s)
+    return result
+def page_run_shots(api, vk_id, lists):
+    st = get_report_settings()
+    group_id = st["group_id"]
+    if not group_id:
+        raise RuntimeError("не задано сообщество (/отгруппа)")
+    today = today_local()
+    start = datetime(today.year, today.month, today.day, tzinfo=MSK)
+    ts_from = int(start.timestamp())
+    ts_to = int((start + timedelta(days=1)).timestamp())
+
+    found = []   # (date, attachment)
+    for n in lists:
+        topic_id = st["topic_otchety"] if n == 1 else st["topic_ot"]
+        if not topic_id:
+            continue
+        comments = fetch_topic_comments(api, group_id, topic_id, ts_from, ts_to)
+        for c in comments:
+            if c.get("from_id") != vk_id:
+                continue
+            for att in _comment_attachments(c):
+                found.append((c.get("date", 0), att))
+    found.sort(key=lambda x: x[0])
+    atts = list(dict.fromkeys(a for _, a in found))
+    if not atts:
+        page_send(api, "СКРИНЫ_НЕТ")
+        return
+    chunks = [atts[i:i + 10] for i in range(0, len(atts), 10)]
+    total = len(chunks)
+    for i, chunk in enumerate(chunks, 1):
+        page_send_att(api, "СКРИНЫ " + str(i) + "/" + str(total), ",".join(chunk))
+        time.sleep(0.5)
 def page_on_message(api, ev):
     global PAGE_JOB
     if getattr(ev, "from_me", False):
@@ -1705,6 +1900,19 @@ def page_on_message(api, ev):
     if not text:
         return
     low = text.lower()
+
+    # Команда от основного бота: /скрины <vk_id> <списки>
+    m = re.fullmatch(r"/скрины\s+(\d+)\s+([12](?:,[12])?)", low)
+    if m:
+        try:
+            page_run_shots(api, int(m.group(1)), [int(x) for x in m.group(2).split(",")])
+        except Exception as e:
+            print("Страничный бот: ошибка сбора скринов:", repr(e))
+            try:
+                page_send(api, "ОШИБКА: " + str(e)[:300])
+            except Exception as e2:
+                print("Страничный бот: не удалось сообщить об ошибке:", repr(e2))
+        return
 
     # Команда от основного бота: /от дд.мм.гггг  или  /отчеты дд.мм.гггг
     m = re.fullmatch(r"/(от|отчеты|отчёты)\s+(\d{2}\.\d{2}\.\d{4})", low)
@@ -2366,6 +2574,7 @@ ADMIN_HELP = (
     "/отобс от 1 — обсуждение для /от\n"
     "/отобс отчеты 2 — обсуждение для /отчеты\n"
     "/отчеты дд.мм.гггг — проверка отчётов для /список (общие админы)\n"
+    "/скрины Nick_Name или @username — скрины игрока за сегодня из обсуждений\n"
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n\n"
     "Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин. "
     "После покупки бот спросит дату и «включительно да/нет», затем уведомит админов. "
@@ -2390,6 +2599,7 @@ NADMIN_HELP = (
     "/-магазин 3 — удалить товар из магазина по номеру\n\n"
     "Отчёты (нужен подключённый страничный бот):\n"
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
+    "/скрины Nick_Name или @username — скрины игрока за сегодня\n"
     "/отместо — показать где проверяются отчёты\n"
 )
 def cmd_help(user_id):
@@ -2431,6 +2641,7 @@ ADMIN_SECTIONS = [
     ("Отчёты", [
         ("/отчеты дд.мм.гггг", "Проверка отчётов /список"),
         ("/от дд.мм.гггг", "Проверка отчётов /нлист"),
+        ("/скрины Ник или @юз", "Скрины игрока за сегодня"),
         ("/отгруппа 123456", "Сообщество с отчётами"),
         ("/отобс от 1  ·  /отобс отчеты 2", "Обсуждения для проверки"),
         ("/отместо", "Где сейчас проверяются отчёты"),
@@ -2467,6 +2678,7 @@ NADMIN_SECTIONS = [
     ]),
     ("Отчёты", [
         ("/от дд.мм.гггг", "Проверка отчётов /нлист"),
+        ("/скрины Ник или @юз", "Скрины игрока за сегодня"),
         ("/отместо", "Где сейчас проверяются отчёты"),
     ]),
     ("Рассылка", [
@@ -2820,6 +3032,12 @@ def handle(text, user_id, peer_id=0):
             return warn
         return cmd_reports_start(args[0], 2, peer_id)
 
+    # Скрины игрока за сегодня: /скрины Nick или @username
+    if raw_cmd in ("/скрины", "/скины"):
+        if not is_common and not is_nadmin:
+            return None
+        return cmd_shots(args, user_id, peer_id, is_common)
+
     # Настройки «где проверять отчёты» — только общие админы
     if raw_cmd == "/отместо":
         return cmd_report_settings(raw_cmd, args, user_id)
@@ -2948,11 +3166,13 @@ def process_event(event):
         return
 
     # ======================================================
-    # ОТЧЁТЫ: диалог со страничным ботом (его сообщения в ЛС сообщества).
+    # ОТЧЁТЫ и СКРИНЫ: диалог со страничным ботом (его сообщения в ЛС сообщества).
     # Если активной проверки нет — сообщение обрабатывается как обычное.
     # ======================================================
     if is_dm and is_page_connected() and from_id == get_page_user_id():
         try:
+            if handle_page_shots(msg):
+                return
             if handle_page_dialog(from_id, text):
                 return
         except Exception as e:
