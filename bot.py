@@ -1705,8 +1705,17 @@ def cmd_shots(args, user_id, peer_id, is_common):
             SHOTS_STATE.pop(peer_id, None)
         return "❌ Не удалось написать страничному боту."
     return "🔎 Ищу скрины " + nick + " за сегодня, ждите..."
+def _best_photo_url(ph):
+    sizes = ph.get("sizes") or []
+    if sizes:
+        try:
+            best = max(sizes, key=lambda s: (s.get("width", 0) or 0) * (s.get("height", 0) or 0))
+            return best.get("url") or ""
+        except Exception:
+            pass
+    return ""
 def _extract_attachments(msg):
-    """Достаёт attachment-строки (фото и картинки-документы) из входящего сообщения."""
+    """Достаёт [(attachment-строка, ссылка)] из сообщения: фото и картинки-документы."""
     result = []
     for a in msg.get("attachments") or []:
         t = a.get("type")
@@ -1715,14 +1724,56 @@ def _extract_attachments(msg):
             s = "photo" + str(ph.get("owner_id")) + "_" + str(ph.get("id"))
             if ph.get("access_key"):
                 s += "_" + str(ph["access_key"])
-            result.append(s)
+            result.append((s, _best_photo_url(ph)))
         elif t == "doc":
             dc = a.get("doc") or {}
             s = "doc" + str(dc.get("owner_id")) + "_" + str(dc.get("id"))
             if dc.get("access_key"):
                 s += "_" + str(dc["access_key"])
-            result.append(s)
+            result.append((s, dc.get("url") or ""))
     return result
+def _full_attachments(msg):
+    """Вложения из события + из полной версии сообщения (в событии VK может отдать не всё)."""
+    items = _extract_attachments(msg)
+    cmid = msg.get("conversation_message_id")
+    if cmid:
+        try:
+            res = vk.messages.getByConversationMessageId(
+                peer_id=msg["peer_id"], conversation_message_ids=cmid)
+            lst = res.get("items") if isinstance(res, dict) else res
+            if lst:
+                full = _extract_attachments(lst[0])
+                if len(full) >= len(items):
+                    items = full
+        except Exception as e:
+            print("Скрины: не удалось получить полное сообщение:", repr(e))
+    return items
+def _send_shots(peer_id, header, items):
+    """Отправляет скрины пачками по 10; если пачка не прошла — по одному, остаток шлёт ссылками."""
+    failed = []
+    for i in range(0, len(items), 10):
+        batch = items[i:i + 10]
+        text = header if i == 0 else "…продолжение"
+        try:
+            vk.messages.send(peer_id=peer_id, message=text,
+                             attachment=",".join(a for a, _ in batch), random_id=get_random_id())
+        except Exception as e:
+            print("Скрины: пачка не отправилась, шлю по одному:", repr(e))
+            if i == 0:
+                reply(peer_id, header)
+            for att, url in batch:
+                try:
+                    vk.messages.send(peer_id=peer_id, message="", attachment=att, random_id=get_random_id())
+                except Exception as e2:
+                    print("Скрины: не отправилось " + att + ":", repr(e2))
+                    failed.append((att, url))
+                time.sleep(0.3)
+        time.sleep(0.4)
+    if failed:
+        lines = ["⚠️ Не удалось прикрепить фото: " + str(len(failed)) + " шт."]
+        for att, url in failed:
+            lines.append(url or att)
+        reply_long(peer_id, "\n".join(lines))
 def handle_page_shots(msg):
     """Сообщение от страничного бота со скринами. True — обработано."""
     from_id = msg.get("from_id")
@@ -1756,29 +1807,31 @@ def handle_page_shots(msg):
     if not m:
         return False
     idx, total = int(m.group(1)), int(m.group(2))
-    atts = _extract_attachments(msg)
+    items = _full_attachments(msg)
+    print("Скрины: часть " + str(idx) + "/" + str(total) + ", вложений: " + str(len(items)))
     with lock:
-        st["parts"][idx] = atts
+        st["parts"][idx] = items
         st["total"] = total
         st["ts"] = time.time()
         ready = len(st["parts"]) >= total
     if ready:
         with lock:
             SHOTS_STATE.pop(peer_id, None)
-        all_atts = []
+        all_items = []
+        seen = set()
         for i in sorted(st["parts"]):
-            all_atts.extend(st["parts"][i])
-        if not all_atts:
+            for att, url in st["parts"][i]:
+                if att not in seen:
+                    seen.add(att)
+                    all_items.append((att, url))
+        if not all_items:
             reply(peer_id, "📭 У " + st["nick"] + " нет скринов за сегодня.")
             return True
         header = (
             "📸 Скрины " + st["nick"] + " за " + today_local().strftime("%d.%m.%Y")
-            + " (" + ", ".join(LIST_TITLE[x] for x in st["lists"]) + "): " + str(len(all_atts))
+            + " (" + ", ".join(LIST_TITLE[x] for x in st["lists"]) + "): " + str(len(all_items))
         )
-        for i in range(0, len(all_atts), 10):
-            batch = all_atts[i:i + 10]
-            reply(peer_id, header if i == 0 else "…продолжение", attachment=",".join(batch))
-            time.sleep(0.4)
+        _send_shots(peer_id, header, all_items)
     return True
 # ==========================================================
 # ОТЧЁТЫ: сторона СТРАНИЧНОГО БОТА (аккаунт пользователя, longpoll по user-токену)
