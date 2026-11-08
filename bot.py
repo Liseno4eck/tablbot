@@ -107,6 +107,7 @@ executor = ThreadPoolExecutor(max_workers=8)
 # Список 2 (/нлист):   nplayers, nshop, nadmins
 # contacts: все, кто писал боту в ЛС (для /рассылка)
 # purchase_counter: сквозной счётчик номеров покупок (общий для обоих списков)
+# contest: конкурс — период и заработанные баллы (для /конкурс и /итоги)
 # players: nick_lower -> {
 #   nick, vk_id, points, vacation (строка для показа), otgul,
 #   vac_stage (None | "date" | "incl"),
@@ -130,6 +131,8 @@ data = {
     "reports": {},
     # ники для отчётов (складываются в Gist)
     "report_nicks": {},
+    # конкурс: период и заработанные баллы
+    "contest": {"start": "", "end": "", "earned": {}},
 }
 CONTACTS = set()
 LAST_BUY = {}
@@ -483,6 +486,36 @@ def _norm_report_settings(raw):
         "topic_ot": _pid(raw.get("topic_ot"), REPORT_TOPIC_ID_OT),
         "topic_otchety": _pid(raw.get("topic_otchety"), REPORT_TOPIC_ID_OTCHETY),
     }
+def _norm_contest(raw):
+    """Конкурс: start/end (ISO даты) и earned: "список:vk_id" -> {nick, n, pts}."""
+    raw = raw if isinstance(raw, dict) else {}
+    start = str(raw.get("start") or "")
+    end = str(raw.get("end") or "")
+    try:
+        date.fromisoformat(start)
+        date.fromisoformat(end)
+    except ValueError:
+        start = ""
+        end = ""
+    earned = {}
+    src = raw.get("earned")
+    if isinstance(src, dict):
+        for key, value in src.items():
+            if not isinstance(value, dict):
+                continue
+            nick = str(value.get("nick") or "").strip()
+            if not nick:
+                continue
+            try:
+                pts = int(value.get("pts", 0))
+            except (TypeError, ValueError):
+                pts = 0
+            try:
+                n = int(value.get("n", 1))
+            except (TypeError, ValueError):
+                n = 1
+            earned[str(key)] = {"nick": nick, "n": 2 if n == 2 else 1, "pts": max(0, pts)}
+    return {"start": start, "end": end, "earned": earned}
 def _assign_purchase_ids(players1, players2, counter):
     """Старым покупкам без номера выдаёт номера (по времени). Возвращает новый счётчик."""
     all_purchases = []
@@ -519,6 +552,7 @@ def _normalize_loaded(loaded):
         "report_settings": _norm_report_settings(loaded.get("report_settings")),
         "reports": _norm_reports(loaded.get("reports")),
         "report_nicks": _norm_reports(loaded.get("report_nicks")),
+        "contest": _norm_contest(loaded.get("contest")),
     }
 def load_data():
     local = _read_local()
@@ -558,6 +592,7 @@ def load_data():
     data["report_settings"] = normalized["report_settings"]
     data["reports"] = normalized["reports"]
     data["report_nicks"] = normalized["report_nicks"]
+    data["contest"] = normalized["contest"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -840,6 +875,150 @@ def get_user_name(user_id):
         print("Ошибка получения имени:", repr(e))
     return "пользователя"
 # ==========================================================
+# КОНКУРС: подсчёт заработанных баллов за период (по МСК)
+# Считаются только начисления (/выдать). Если баллы забрали (/забрать) —
+# вычитаются. Покупки в магазине и откаты с возвратом НЕ влияют.
+# Ключ записи: "номер_списка:vk_id", так что каждый ник считается отдельно.
+# ==========================================================
+def parse_contest_date(text):
+    """'15.11.2026' или '15.11' (год — текущий) -> date. Иначе None."""
+    match = re.fullmatch(DATE_RE, text.strip())
+    if not match:
+        return None
+    try:
+        year_raw = match.group(3)
+        if year_raw:
+            year = int(year_raw)
+            if year < 100:
+                year += 2000
+        else:
+            year = today_local().year
+        return date(year, int(match.group(2)), int(match.group(1)))
+    except ValueError:
+        return None
+def contest_period():
+    """(start, end) как date или (None, None), если конкурс не задан."""
+    contest = data.get("contest") or {}
+    try:
+        return date.fromisoformat(contest.get("start", "")), date.fromisoformat(contest.get("end", ""))
+    except ValueError:
+        return None, None
+def contest_running():
+    """Идёт ли конкурс прямо сейчас (сегодня по МСК между датами включительно)."""
+    start, end = contest_period()
+    if start is None:
+        return False
+    return start <= today_local() <= end
+def contest_record(n, player, delta):
+    """Вызывать под lock при изменении баллов выдачей/забором. delta > 0 — выдали, < 0 — забрали."""
+    if not contest_running():
+        return
+    contest = data.setdefault("contest", {"start": "", "end": "", "earned": {}})
+    earned = contest.setdefault("earned", {})
+    key = str(n) + ":" + str(player["vk_id"])
+    entry = earned.get(key)
+    if entry is None:
+        entry = {"nick": player["nick"], "n": n, "pts": 0}
+        earned[key] = entry
+    entry["nick"] = player["nick"]
+    entry["pts"] = max(0, int(entry.get("pts", 0)) + delta)
+def contest_rename(n, vk_id, new_nick):
+    """При смене ника обновляем имя в конкурсе (под lock)."""
+    entry = (data.get("contest") or {}).get("earned", {}).get(str(n) + ":" + str(vk_id))
+    if entry is not None:
+        entry["nick"] = new_nick
+def _fmt_full_date(d):
+    return d.strftime("%d.%m.%Y")
+def cmd_contest(args):
+    """/конкурс дд.мм.гггг дд.мм.гггг — запустить; /конкурс — статус; /конкурс стоп — сбросить."""
+    usage = (
+        "Формат: /конкурс дата_начала дата_конца\n"
+        "Например: /конкурс 10.11.2026 20.11.2026 (или /конкурс 10.11 20.11)\n"
+        "/конкурс — показать текущий конкурс\n"
+        "/конкурс стоп — остановить и сбросить конкурс"
+    )
+    if not args:
+        with lock:
+            start, end = contest_period()
+            total = len((data.get("contest") or {}).get("earned", {}))
+        if start is None:
+            return "Конкурс не запущен.\n\n" + usage
+        today = today_local()
+        if today < start:
+            status = "ещё не начался"
+        elif today <= end:
+            status = "идёт"
+        else:
+            status = "закончился"
+        return (
+            "🏁 Конкурс: " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (" + status + ")\n"
+            "Игроков с баллами: " + str(total) + "\n"
+            "Результаты: /итоги"
+        )
+    if args[0].lower() in ("стоп", "сброс", "stop", "отмена"):
+        with lock:
+            data["contest"] = {"start": "", "end": "", "earned": {}}
+            save_data()
+        return "✅ Конкурс остановлен, данные сброшены."
+    if len(args) != 2:
+        return usage
+    start = parse_contest_date(args[0])
+    end = parse_contest_date(args[1])
+    if start is None or end is None:
+        return "Не понял даты.\n\n" + usage
+    if end < start:
+        return "Дата конца не может быть раньше даты начала."
+    with lock:
+        data["contest"] = {"start": start.isoformat(), "end": end.isoformat(), "earned": {}}
+        save_data()
+    today = today_local()
+    if today < start:
+        note = "Подсчёт начнётся " + _fmt_full_date(start) + " (МСК)."
+    elif today <= end:
+        note = "Подсчёт идёт с этого момента."
+    else:
+        note = "⚠️ Конкурс уже закончился, новые баллы считаться не будут."
+    return (
+        "✅ Конкурс запущен: " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + ".\n"
+        "Считаются только выданные баллы (/выдать); если баллы забрали (/забрать) — вычитаются, "
+        "покупки в магазине не вычитаются. Время по МСК.\n"
+        + note + "\n"
+        "Итоги: /итоги"
+    )
+def cmd_contest_results():
+    """/итоги — все ники из обоих списков по заработанным баллам, от большего к меньшему."""
+    with lock:
+        start, end = contest_period()
+        if start is None:
+            return "Конкурс не запущен. Запустить: /конкурс дата_начала дата_конца"
+        earned = dict((data.get("contest") or {}).get("earned", {}))
+        rows = {}
+        for key, e in earned.items():
+            rows[key] = (e.get("nick", "?"), int(e.get("n", 1)), int(e.get("pts", 0)))
+        # добавляем всех текущих игроков, даже если у них 0
+        for n in (1, 2):
+            for p in P(n).values():
+                key = str(n) + ":" + str(p["vk_id"])
+                if key not in rows:
+                    rows[key] = (p["nick"], n, 0)
+    today = today_local()
+    if today < start:
+        status = "ещё не начался"
+    elif today <= end:
+        status = "идёт"
+    else:
+        status = "закончился"
+    items = sorted(rows.values(), key=lambda r: (-r[2], r[0].lower()))
+    if not items:
+        return "Пока нет игроков."
+    lines = [
+        "🏆 Итоги конкурса " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (" + status + "):",
+        "",
+    ]
+    for i, (nick, n, pts) in enumerate(items, 1):
+        lines.append(str(i) + ". " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
+    return "\n".join(lines)
+# ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
 def cmd_give(args, sign, n):
@@ -856,6 +1035,7 @@ def cmd_give(args, sign, n):
         if sign < 0 and player["points"] < amount:
             return "У " + player["nick"] + " только " + str(player["points"]) + " баллов, забрать " + str(amount) + " нельзя."
         player["points"] += sign * amount
+        contest_record(n, player, sign * amount)
         nick = player["nick"]
         points = player["points"]
         save_data()
@@ -936,6 +1116,7 @@ def cmd_change(args, n):
         del P(n)[old_nick.lower()]
         player["nick"] = new
         P(n)[new.lower()] = player
+        contest_rename(n, player["vk_id"], new)
         save_data()
         return "Ник изменён: " + old_nick + " -> " + new + "."
 # ==========================================================
@@ -2419,6 +2600,7 @@ def do_buy(user_id, n, idx, price, crc):
         purchase_id = int(data.get("purchase_counter", 0) or 0) + 1
         data["purchase_counter"] = purchase_id
 
+        # покупка в магазине НЕ влияет на баллы конкурса (они считают только заработанное)
         player["points"] -= item_price
         left = player["points"]
 
@@ -2680,6 +2862,11 @@ ADMIN_HELP = (
     "/снятьвд @username — забрать доступ админа\n"
     "/вдв @username — выдать доступ только к списку /нлист\n"
     "/снятьвдв @username — забрать доступ к /нлист\n\n"
+    "Конкурс (общие админы):\n"
+    "/конкурс 10.11.2026 20.11.2026 — запустить конкурс (даты начала и конца)\n"
+    "/конкурс — показать текущий конкурс\n"
+    "/конкурс стоп — остановить и сбросить\n"
+    "/итоги — кто сколько заработал баллов за конкурс (оба списка, от большего к меньшему)\n\n"
     "Отчёты (нужен подключённый страничный бот + настройки места проверки):\n"
     "/отместо — показать где проверяются отчёты\n"
     "/отгруппа 123456 — ID сообщества, где лежат отчёты\n"
@@ -2747,6 +2934,12 @@ ADMIN_SECTIONS = [
         ("/откат 5", "Откатить покупку №5"),
         ("/откат 5 вернуть", "Откатить и вернуть баллы"),
     ]),
+    ("Конкурс", [
+        ("/конкурс 10.11 20.11", "Запустить конкурс (даты)"),
+        ("/конкурс", "Показать текущий конкурс"),
+        ("/конкурс стоп", "Остановить и сбросить"),
+        ("/итоги", "Кто сколько заработал баллов"),
+    ]),
     ("Рассылки", [
         ("/разослать1|2 текст", "Всем игрокам списка"),
         ("/рассылка текст", "Всем, кто писал боту"),
@@ -2812,6 +3005,9 @@ ADMIN_CAPTION = (
     "/рассылка и /разослать — это разные команды.\n\n"
     "• /кто — показывает привязанных игроков, которым бот не может написать "
     "(не писали боту или запретили сообщения). Им не приходят рассылки и уведомления.\n\n"
+    "• /конкурс — задаёт даты начала и конца (например /конкурс 10.11.2026 20.11.2026). "
+    "Бот считает только выданные баллы за этот период: если баллы забрали — вычитает, "
+    "покупки в магазине не вычитает. /итоги — общий список всех ников от большего к меньшему.\n\n"
     "• При откате нужно указывать номер покупки. "
     "Если надо вернуть баллы, в конце пишем «вернуть».\n\n"
     "• Если после окончания отгула случился баг и надпись «отгул» висит, "
@@ -3131,6 +3327,12 @@ def handle(text, user_id, peer_id=0):
     if raw_cmd == "/рассылка":
         return cmd_broadcast_all(text) if is_common else None
 
+    # Конкурс — только общие админы: /конкурс дата дата, /итоги
+    if raw_cmd in ("/конкурс", "/конкрус"):
+        return cmd_contest(args) if is_common else None
+    if raw_cmd == "/итоги":
+        return cmd_contest_results() if is_common else None
+
     # Кому не доходят сообщения бота: /кто (общие админы — оба списка, /вдв — только /нлист)
     if raw_cmd == "/кто":
         if not is_common and not is_nadmin:
@@ -3418,6 +3620,9 @@ def main():
     )
     print("Владелец обращений (/написать):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
+    c_start, c_end = contest_period()
+    if c_start is not None:
+        print("Конкурс:", c_start.isoformat(), "—", c_end.isoformat(), "| игроков с баллами:", len(data["contest"].get("earned", {})))
     page = data.get("page", {})
     if page.get("token"):
         print("Страничный бот подключён: user=" + str(page.get("user_id")))
