@@ -1737,7 +1737,7 @@ def cmd_reply_to_user(msg, from_id, text):
     try:
         vk.messages.send(
             user_id=target_id,
-            message="Ответ от администратора: " + answer_text, "Для ответа используйте написать"
+            message="Ответ от администратора: " + answer_text,
             random_id=get_random_id(),
         )
     except Exception as e:
