@@ -45,7 +45,8 @@ GIST_TOKEN_FALLBACK = ""
 GIST_ID_FALLBACK = ""
 # Всё время (даты отпуска) считается по Москве
 MSK = timezone(timedelta(hours=3))
-DEFAULT_VACATION_MAX_DAYS = 4
+# Максимум дней отпуска от сегодняшнего дня (для /отпуск)
+DEFAULT_VACATION_MAX_DAYS = 7
 # Сколько мест показывать в /топ
 TOP_LIMIT = 10
 # Сколько товаров на одной странице кнопок магазина
@@ -110,11 +111,14 @@ executor = ThreadPoolExecutor(max_workers=8)
 # contest: конкурс — период и заработанные баллы (для /конкурс и /итоги)
 # players: nick_lower -> {
 #   nick, vk_id, points, vacation (строка для показа), otgul,
+#   otgul_end (ISO дата последнего дня отгула или None),
 #   vac_stage (None | "date" | "incl"),
 #   vac_max (макс. дней), vac_pending (данные покупки до подтверждения),
 #   vac_end (ISO дата окончания), vac_incl (True/False/None),
 #   purchases (история покупок для /откат, у каждой есть "id" — номер покупки)
 # }
+# last_admin_msg: "vk_id" -> admin_id — какой админ последний написал этому игроку
+# (через /смс или /ответить). Именно этому админу придёт следующее /написать от игрока.
 # ==========================================================
 lock = threading.RLock()
 save_lock = threading.Lock()
@@ -133,6 +137,8 @@ data = {
     "report_nicks": {},
     # конкурс: период и заработанные баллы
     "contest": {"start": "", "end": "", "earned": {}},
+    # последний админ, написавший игроку (через /смс или /ответить)
+    "last_admin_msg": {},
 }
 CONTACTS = set()
 LAST_BUY = {}
@@ -330,6 +336,24 @@ def _read_local():
         except Exception:
             pass
         return None
+def _norm_date_field(raw):
+    """ISO-строка даты -> та же строка, если дата корректна. Иначе None."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    try:
+        return date.fromisoformat(text).isoformat()
+    except (ValueError, TypeError):
+        return None
+def _norm_date_field(raw):
+    """ISO-дата в строку ISO или None (пусто/битое -> None)."""
+    if not raw:
+        return None
+    text = str(raw).strip()
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError:
+        return None
 def _norm_purchases(raw):
     result = []
     if isinstance(raw, list):
@@ -376,6 +400,10 @@ def _norm_players(raw_players):
                 otgul = int(value.get("otgul", 0) or 0)
             except (TypeError, ValueError):
                 otgul = 0
+            # отгул теперь хранится как дата последнего дня (ISO), а не счётчик покупок
+            otgul_end = _norm_date_field(value.get("otgul_end"))
+            if otgul > 0 and not otgul_end:
+                otgul_end = today_local().isoformat()
             if not nick or vk_id <= 0:
                 continue
             # стадия ожидания отпуска (с совместимостью со старым waiting_vacation)
@@ -401,6 +429,7 @@ def _norm_players(raw_players):
                 "points": points,
                 "vacation": value.get("vacation"),
                 "otgul": otgul,
+                "otgul_end": otgul_end,
                 "vac_stage": vac_stage,
                 "vac_max": vac_max,
                 "vac_pending": vac_pending,
@@ -410,6 +439,7 @@ def _norm_players(raw_players):
             }
     return players
 def _norm_shop(raw_shop):
+    """Магазин. Товары «отгул» и «отпуск» больше не продаются — убираются из списка."""
     shop = []
     if isinstance(raw_shop, list):
         for item in raw_shop:
@@ -420,8 +450,11 @@ def _norm_shop(raw_shop):
                 price = int(item.get("price", 0))
             except (TypeError, ValueError):
                 continue
-            if name and price > 0:
-                shop.append({"name": name, "price": price})
+            if not name or price <= 0:
+                continue
+            if is_vacation_item(name) or name.lower() == "отгул":
+                continue
+            shop.append({"name": name, "price": price})
     return shop
 def _norm_ids(raw_ids):
     ids = []
@@ -516,6 +549,22 @@ def _norm_contest(raw):
                 n = 1
             earned[str(key)] = {"nick": nick, "n": 2 if n == 2 else 1, "pts": max(0, pts)}
     return {"start": start, "end": end, "earned": earned}
+def _norm_last_admin_msg(raw):
+    """Кто из админов последний писал игроку: "vk_id" -> admin_id."""
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for key, value in raw.items():
+        key = str(key).strip()
+        if not re.fullmatch(r"\d+", key):
+            continue
+        try:
+            admin_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if admin_id > 0:
+            result[key] = admin_id
+    return result
 def _assign_purchase_ids(players1, players2, counter):
     """Старым покупкам без номера выдаёт номера (по времени). Возвращает новый счётчик."""
     all_purchases = []
@@ -553,6 +602,7 @@ def _normalize_loaded(loaded):
         "reports": _norm_reports(loaded.get("reports")),
         "report_nicks": _norm_reports(loaded.get("report_nicks")),
         "contest": _norm_contest(loaded.get("contest")),
+        "last_admin_msg": _norm_last_admin_msg(loaded.get("last_admin_msg")),
     }
 def load_data():
     local = _read_local()
@@ -593,6 +643,7 @@ def load_data():
     data["reports"] = normalized["reports"]
     data["report_nicks"] = normalized["report_nicks"]
     data["contest"] = normalized["contest"]
+    data["last_admin_msg"] = normalized["last_admin_msg"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -717,6 +768,128 @@ def vacation_active(player):
         _clear_vacation(player)
         return False, True
     return True, False
+
+def otgul_active(player):
+    """Отгул: активен, если today <= otgul_end. Просроченный сбрасывается.
+    Возвращает (active, changed)."""
+    raw = player.get("otgul_end")
+    if not raw:
+        return False, False
+    try:
+        end = date.fromisoformat(raw)
+    except ValueError:
+        player["otgul_end"] = None
+        return False, True
+    if today_local() > end:
+        player["otgul_end"] = None
+        return False, True
+    return True, False
+# ==========================================================
+# КОМАНДЫ АДМИНА: /отгул, /отпуск, /смс
+# ==========================================================
+def _resolve_player(target, is_common):
+    """Находит игрока по нику, @username или vk.com/id... Возвращает (n, player) или (None, None)."""
+    lists = (1, 2) if is_common else (2,)
+    with lock:
+        for n in lists:
+            p = find_by_nick(n, target)
+            if p:
+                return n, p
+    uid = resolve_user(target)
+    if uid:
+        with lock:
+            for n in lists:
+                p = find_by_id(n, uid)
+                if p:
+                    return n, p
+    return None, None
+def cmd_otgul(args, is_common):
+    """/отгул Ник — выдать отгул. /отгул Ник снять (или повторный вызов) — снять."""
+    if len(args) < 1:
+        return "Формат: /отгул Ник_Name или @username или ссылка на ВК\nСнять: /отгул Ник_Name снять"
+    n, player = _resolve_player(args[0], is_common)
+    if player is None:
+        return "Игрок " + args[0] + " не найден."
+    want_remove = len(args) > 1 and args[1].lower() in ("снять", "убрать", "стоп", "off")
+    if want_remove and not player.get("otgul_end"):
+        return "У " + player["nick"] + " отгула нет (" + LIST_TITLE[n] + ")."
+    with lock:
+        if player.get("otgul_end") and (want_remove or len(args) == 1):
+            player["otgul_end"] = None
+            save_data()
+            return "✅ Отгул снят: " + player["nick"] + " (" + LIST_TITLE[n] + ")."
+        player["otgul_end"] = today_local().isoformat()
+        save_data()
+        return "✅ Отгул выдан на сегодня: " + player["nick"] + " (" + LIST_TITLE[n] + ")."
+def cmd_otpusk(args, is_common):
+    """/отпуск — показать кто в отпуске/отгуле.
+    /отпуск Ник ДД.ММ — выдать отпуск до даты. /отпуск Ник снять — снять."""
+    if not args:
+        # показать всех кто в отпуске или отгуле
+        lists = (1, 2) if is_common else (2,)
+        lines = ["📋 Отпуска и отгулы:"]
+        found = False
+        for n in lists:
+            with lock:
+                players = list(P(n).values())
+            for p in players:
+                vac = p.get("vacation")
+                if vac:
+                    lines.append(LIST_TITLE[n] + ": " + p["nick"] + " — отпуск до " + str(vac))
+                    found = True
+                if p.get("otgul_end"):
+                    lines.append(LIST_TITLE[n] + ": " + p["nick"] + " — отгул")
+                    found = True
+        if not found:
+            lines.append("  Пока никого нет.")
+        return "\n".join(lines)
+    n, player = _resolve_player(args[0], is_common)
+    if player is None:
+        return "Игрок " + args[0] + " не найден."
+    want_remove = len(args) > 1 and args[1].lower() in ("снять", "убрать", "стоп", "off")
+    if want_remove and not player.get("vacation"):
+        return "У " + player["nick"] + " отпуска нет (" + LIST_TITLE[n] + ")."
+    if not player.get("vacation"):
+        if len(args) < 2:
+            return "Формат: /отпуск Ник 15.12 (или /отпуск Ник 15.12.2026)"
+        end = parse_vacation_date(args[1])
+        if end is None:
+            return "Не понял дату. Напишите в формате ДД.ММ или ДД.ММ.ГГГГ."
+        if end < today_local():
+            return "Эта дата уже прошла."
+        with lock:
+            player["vacation"] = format_date(end)
+            player["vac_end"] = end.isoformat()
+            player["vac_incl"] = True
+            player["vac_stage"] = None
+            player["vac_pending"] = None
+            player["otgul_end"] = None
+            save_data()
+            return "✅ Отпуск выдан до " + format_date(end) + ": " + player["nick"] + " (" + LIST_TITLE[n] + ")."
+    with lock:
+        _clear_vacation(player)
+        save_data()
+        return "✅ Отпуск снят: " + player["nick"] + " (" + LIST_TITLE[n] + ")."
+def cmd_sms(args, is_common, admin_id):
+    """/смс Ник Текст — отправить сообщение игроку от имени администратора."""
+    if len(args) < 2:
+        return "Формат: /смс Ник_Name Текст сообщения"
+    n, player = _resolve_player(args[0], is_common)
+    if player is None:
+        return "Игрок " + args[0] + " не найден."
+    text = " ".join(args[1:])
+    vk_id = player["vk_id"]
+    nick = player["nick"]
+    message = "💬 Сообщение от администратора:\n" + text
+    try:
+        vk.messages.send(user_id=vk_id, message=message, random_id=get_random_id())
+    except Exception as e:
+        print("Ошибка отправки /смс:", repr(e))
+        return "❌ Не удалось отправить сообщение " + nick + " (" + repr(e) + ")"
+    with lock:
+        data.setdefault("last_admin_msg", {})[str(vk_id)] = admin_id
+        save_data()
+    return "✅ Сообщение отправлено: " + nick + " (" + LIST_TITLE[n] + ")."
 # ==========================================================
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
@@ -1051,6 +1224,7 @@ def new_player(nick, user_id):
         "points": 0,
         "vacation": None,
         "otgul": 0,
+        "otgul_end": None,
         "vac_stage": None,
         "vac_max": DEFAULT_VACATION_MAX_DAYS,
         "vac_pending": None,
@@ -1283,6 +1457,8 @@ def cmd_list(args, n):
         for p in P(n).values():
             _, ch = vacation_active(p)
             changed = changed or ch
+            _, ch2 = otgul_active(p)
+            changed = changed or ch2
         if changed:
             save_data()
         players = sorted(
@@ -1294,11 +1470,11 @@ def cmd_list(args, n):
         lines = []
         for i, p in enumerate(players, 1):
             vacation = p.get("vacation")
-            otgul = p.get("otgul", 0)
+            otgul_end = p.get("otgul_end")
             link = "(vk.com/id" + str(p["vk_id"]) + ")"
             if vacation:
                 status = "отпуск до " + str(vacation)
-            elif otgul:
+            elif otgul_end:
                 status = "отгул"
             else:
                 status = str(p["points"])
@@ -1477,13 +1653,21 @@ def cmd_broadcast_all(raw_text):
         time.sleep(0.1)
     return "Рассылка завершена. Отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
 # ==========================================================
-# /написать — обращение ТОЛЬКО владельцу (OWNER_ID)
+# /написать — обращение последнему писавшему админу (или владельцу)
 # ==========================================================
+def _last_admin_for(from_id):
+    """Возвращает ID админа, который последний писал этому игроку, или OWNER_ID."""
+    with lock:
+        last = (data.get("last_admin_msg") or {}).get(str(from_id))
+    if last and (last in ALLOWED_IDS or last in NADMIN_IDS):
+        return last
+    return OWNER_ID
 def cmd_write(msg, from_id, text):
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         return "Формат: /написать текст"
     body_text = parts[1].strip()
+    target_admin = _last_admin_for(from_id)
     name = get_user_name(from_id)
     kb = VkKeyboard(inline=True)
     kb.add_openlink_button("💬 В чат", "https://vk.com/gim" + str(GROUP_ID) + "?sel=" + str(from_id))
@@ -1494,7 +1678,7 @@ def cmd_write(msg, from_id, text):
     if cmid:
         try:
             vk.messages.send(
-                user_id=OWNER_ID,
+                user_id=target_admin,
                 message=header,
                 random_id=get_random_id(),
                 keyboard=keyboard,
@@ -1510,7 +1694,7 @@ def cmd_write(msg, from_id, text):
     if not sent:
         try:
             vk.messages.send(
-                user_id=OWNER_ID,
+                user_id=target_admin,
                 message=header + ":\n\n" + body_text,
                 random_id=get_random_id(),
                 keyboard=keyboard,
@@ -1520,13 +1704,13 @@ def cmd_write(msg, from_id, text):
             return "Не удалось отправить сообщение. Попробуйте позже."
     return "✅ Ваше сообщение отправлено."
 # ==========================================================
-# /ответить — ответ владельца на обращение (/написать)
+# /ответить — ответ админа на обращение (/написать)
 # Использование: ответить (reply) на сообщение бота «📩 Сообщение от ...»
 # и написать /ответить текст. Пользователь получит:
 # «Ответ от администратора: текст»
 # ==========================================================
 def cmd_reply_to_user(msg, from_id, text):
-    if from_id != OWNER_ID:
+    if from_id not in ALLOWED_IDS and from_id not in NADMIN_IDS:
         return None
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
@@ -1553,12 +1737,15 @@ def cmd_reply_to_user(msg, from_id, text):
     try:
         vk.messages.send(
             user_id=target_id,
-            message="Ответ от администратора: " + answer_text,
+            message="Ответ от администратора: " + answer_text, "Для ответа используйте написать"
             random_id=get_random_id(),
         )
     except Exception as e:
         print("Не удалось отправить ответ:", repr(e))
         return "❌ Не удалось отправить ответ пользователю."
+    with lock:
+        data.setdefault("last_admin_msg", {})[str(target_id)] = from_id
+        save_data()
     return "✅ Ответ отправлен [id" + str(target_id) + "|пользователю]."
 # ==========================================================
 # ОТЧЁТЫ: общие функции
@@ -1790,7 +1977,8 @@ def _page_status_of(player):
     active, _ = vacation_active(player)
     if active:
         return "отпуск до " + str(player.get("vacation"))
-    if player.get("otgul", 0):
+    otgul_on, _ = otgul_active(player)
+    if otgul_on:
         return "отгул"
     return "работает"
 def handle_page_dialog(from_id, text):
@@ -1820,6 +2008,8 @@ def handle_page_dialog(from_id, text):
             for p in sorted(P(n).values(), key=lambda x: x["nick"].lower()):
                 _, ch = vacation_active(p)
                 changed = changed or ch
+                _, ch2 = otgul_active(p)
+                changed = changed or ch2
                 lines.append(p["nick"] + " | " + str(p["vk_id"]) + " | " + _page_status_of(p))
             if changed:
                 save_data()
@@ -2592,7 +2782,6 @@ def do_buy(user_id, n, idx, price, crc):
         if player["points"] < item_price:
             return "Не хватает баллов. Нужно " + str(item_price) + ", у вас " + str(player["points"]) + "."
         LAST_BUY[key] = now
-        name_lower = item_name.lower().strip()
         nick = player["nick"]
         num = idx + 1
 
@@ -2604,12 +2793,8 @@ def do_buy(user_id, n, idx, price, crc):
         player["points"] -= item_price
         left = player["points"]
 
-        if is_vacation_item(item_name):
-            kind = "vacation"
-        elif name_lower == "отгул":
-            kind = "otgul"
-        else:
-            kind = "other"
+        # отгул и отпуск теперь выдаёт только админ — в магазине всегда kind="other"
+        kind = "other"
         history = player.setdefault("purchases", [])
         history.append({
             "id": purchase_id,
@@ -2621,24 +2806,7 @@ def do_buy(user_id, n, idx, price, crc):
         })
         player["purchases"] = history[-PURCHASE_HISTORY_LIMIT:]
 
-        if kind == "vacation":
-            # Админам НЕ пишем сейчас: уведомление уйдёт после ответа да/нет
-            max_days = vacation_max_days_from_name(item_name)
-            player["vac_stage"] = "date"
-            player["vac_max"] = max_days
-            player["vac_pending"] = {"num": num, "item": item_name, "price": item_price, "pid": purchase_id}
-            save_data()
-            return (
-                "✅ Ваш отпуск оплачен! (покупка №" + str(purchase_id) + ")\n"
-                "Напишите дату окончания отпуска в формате ДД.ММ "
-                "(например 15.12). Максимум до " + str(max_days) + " дн. от сегодняшнего дня (МСК):"
-            )
-
-        if kind == "otgul":
-            player["otgul"] = player.get("otgul", 0) + 1
-            answer = "✅ Вы купили отгул! (покупка №" + str(purchase_id) + ") Осталось баллов: " + str(left) + "."
-        else:
-            answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + "."
+        answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + "."
 
         save_data()
         text = (
@@ -2799,6 +2967,8 @@ def cmd_shop_add(args, n):
     if price <= 0:
         return "Цена должна быть больше 0."
     name = " ".join(args[1:])
+    if is_vacation_item(name) or name.lower().strip() == "отгул":
+        return "Товары «отпуск» и «отгул» больше не продаются — их выдаёт только админ."
     with lock:
         S(n).append({"name": name, "price": price})
         num = len(S(n))
@@ -2848,7 +3018,7 @@ ADMIN_HELP = (
     "/-магазин1 3 и /-магазин2 3 — удалить товар по номеру\n"
     "/разослать1 текст и /разослать2 текст — рассылка по списку\n"
     "/рассылка текст — рассылка всем, кто писал боту\n"
-    "/ответить текст — (владелец) ответом на обращение из /написать отправить ответ пользователю\n"
+    "/ответить текст — (любой админ) ответом на обращение из /написать отправить ответ пользователю\n"
     "/выдать Nick_Name 5 — выдать баллы\n"
     "/забрать Nick_Name 5 — забрать баллы\n"
     "/откат НОМЕР — откатить покупку по её номеру (баллы не возвращаются)\n"
@@ -2862,6 +3032,11 @@ ADMIN_HELP = (
     "/снятьвд @username — забрать доступ админа\n"
     "/вдв @username — выдать доступ только к списку /нлист\n"
     "/снятьвдв @username — забрать доступ к /нлист\n\n"
+    "Отгул / отпуск / смс:\n"
+    "/отгул Ник_Name — выдать отгул (или снять, если уже стоит)\n"
+    "/отпуск — показать кто в отпуске/отгуле\n"
+    "/отпуск Ник_Name 15.12 — выдать отпуск до даты (или снять)\n"
+    "/смс Ник_Name Текст — отправить игроку сообщение от администратора\n\n"
     "Конкурс (общие админы):\n"
     "/конкурс 10.11.2026 20.11.2026 — запустить конкурс (даты начала и конца)\n"
     "/конкурс — показать текущий конкурс\n"
@@ -2875,8 +3050,7 @@ ADMIN_HELP = (
     "/отчеты дд.мм.гггг — проверка отчётов для /список (общие админы)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня из обсуждений\n"
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n\n"
-    "Отпуск: добавьте товар «отпуск максимум до 4 дней» через /+магазин. "
-    "После покупки бот спросит дату и «включительно да/нет», затем уведомит админов. "
+    "Отгул и отпуск теперь выдаёт только админ — в магазине эти товары убраны. "
     "Время считается по МСК."
 )
 NADMIN_HELP = (
@@ -2897,6 +3071,11 @@ NADMIN_HELP = (
     "/разослать текст — рассылка привязанным игрокам\n"
     "/+магазин 100 товар — добавить товар в магазин\n"
     "/-магазин 3 — удалить товар из магазина по номеру\n\n"
+    "Отгул / отпуск / смс:\n"
+    "/отгул Ник_Name — выдать отгул (или снять)\n"
+    "/отпуск — показать кто в отпуске/отгуле\n"
+    "/отпуск Ник_Name 15.12 — выдать отпуск до даты (или снять)\n"
+    "/смс Ник_Name Текст — отправить игроку сообщение от администратора\n\n"
     "Отчёты (нужен подключённый страничный бот):\n"
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня\n"
@@ -2933,6 +3112,12 @@ ADMIN_SECTIONS = [
     ("Покупки", [
         ("/откат 5", "Откатить покупку №5"),
         ("/откат 5 вернуть", "Откатить и вернуть баллы"),
+    ]),
+    ("Отгул / отпуск / смс", [
+        ("/отгул Ник", "Выдать или снять отгул"),
+        ("/отпуск", "Кто сейчас в отпуске/отгуле"),
+        ("/отпуск Ник 15.12", "Выдать или снять отпуск"),
+        ("/смс Ник Текст", "Сообщение игроку от админа"),
     ]),
     ("Конкурс", [
         ("/конкурс 10.11 20.11", "Запустить конкурс (даты)"),
@@ -2984,6 +3169,12 @@ NADMIN_SECTIONS = [
         ("/откат 5", "Откатить покупку №5"),
         ("/откат 5 вернуть", "Откатить и вернуть баллы"),
     ]),
+    ("Отгул / отпуск / смс", [
+        ("/отгул Ник", "Выдать или снять отгул"),
+        ("/отпуск", "Кто сейчас в отпуске/отгуле"),
+        ("/отпуск Ник 15.12", "Выдать или снять отпуск"),
+        ("/смс Ник Текст", "Сообщение игроку от админа"),
+    ]),
     ("Отчёты", [
         ("/от дд.мм.гггг", "Проверка отчётов /нлист"),
         ("/скрины Ник или @юз", "Скрины игрока за сегодня"),
@@ -3010,8 +3201,11 @@ ADMIN_CAPTION = (
     "покупки в магазине не вычитает. /итоги — общий список всех ников от большего к меньшему.\n\n"
     "• При откате нужно указывать номер покупки. "
     "Если надо вернуть баллы, в конце пишем «вернуть».\n\n"
-    "• Если после окончания отгула случился баг и надпись «отгул» висит, "
-    "пишем /откат и номер покупки — тогда баг уйдёт."
+    "• /отгул и /отпуск — админ выдаёт отгул/отпуск игроку командой. "
+    "Повторный вызов снимает. В магазине эти товары убраны.\n\n"
+    "• /смс Ник Текст — отправить сообщение игроку, ему придёт «Сообщение от администратора: ...»\n\n"
+    "• /написать — обращение игрока приходит тому админу, который последний писал ему (через /смс или /ответить).\n\n"
+    "• /ответить — любой админ отвечает на обращение игрока."
 )
 NADMIN_CAPTION = (
     "📖 Пояснения к командам\n\n"
@@ -3020,8 +3214,9 @@ NADMIN_CAPTION = (
     "• /разослать — для рассылки новостей или выдачи баллов.\n\n"
     "• /кто — показывает игроков /нлист, которым бот не может написать "
     "(не писали боту или запретили сообщения).\n\n"
-    "• Если после окончания отгула случился баг и надпись «отгул» висит, "
-    "пишем /откат и номер покупки — тогда баг уйдёт."
+    "• /отгул и /отпуск — админ выдаёт отгул/отпуск игроку командой. "
+    "Повторный вызов снимает. В магазине эти товары убраны.\n\n"
+    "• /смс Ник Текст — отправить сообщение игроку, ему придёт «Сообщение от администратора: ...»"
 )
 # ---------- шрифты ----------
 _FONT_PATHS = {
@@ -3373,6 +3568,22 @@ def handle(text, user_id, peer_id=0):
     if raw_cmd == "/отобс":
         return cmd_report_settings(raw_cmd, args, user_id)
 
+    # /отгул — выдать/снять отгул (общие админы — оба списка, /вдв — /нлист)
+    if raw_cmd == "/отгул":
+        if not is_common and not is_nadmin:
+            return None
+        return cmd_otgul(args, is_common)
+    # /отпуск — выдать/снять отпуск (общие админы — оба списка, /вдв — /нлист)
+    if raw_cmd == "/отпуск":
+        if not is_common and not is_nadmin:
+            return None
+        return cmd_otpusk(args, is_common)
+    # /смс — отправить сообщение игроку (общие админы — оба списка, /вдв — /нлист)
+    if raw_cmd == "/смс":
+        if not is_common and not is_nadmin:
+            return None
+        return cmd_sms(args, is_common, user_id)
+
     command, suffix = split_command(raw_cmd)
     if command not in LIST_COMMANDS or command in ("/баллы", "/магазин", "/купить", "/топ"):
         return None
@@ -3618,7 +3829,7 @@ def main():
         + " | контактов: " + str(len(CONTACTS))
         + " | покупок всего: " + str(data.get("purchase_counter", 0))
     )
-    print("Владелец обращений (/написать):", OWNER_ID)
+    print("Владелец обращений (/написать, если игрок никому не писал):", OWNER_ID)
     print("Сегодня (МСК):", today_local().isoformat())
     c_start, c_end = contest_period()
     if c_start is not None:
