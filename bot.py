@@ -66,7 +66,7 @@ FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 #   Повторная проверка за тот же день: выдаётся только РАЗНИЦА между новой
 #   нормой и тем, что уже было выдано (переплата невозможна).
 # ==========================================================
-REPORT_FULL_SHOTS = 12
+REPORT_FULL_SHOTS = 10
 REPORT_FULL_POINTS = 10
 REPORT_PART_POINTS = 7
 REPORT_MIN_SHOTS = 4          # меньше 4 скринов — 0 баллов
@@ -2136,6 +2136,15 @@ def _report_shots_count(status):
     """'есть отчет 14 скринов' -> 14. Другой статус (нет отчета/отгул/отпуск) -> None."""
     m = re.search(r"есть\s+отч[её]т\s+(\d+)", (status or "").lower())
     return int(m.group(1)) if m else None
+def _shot_status_display(status):
+    """Как показывать статус игрока. Меньше REPORT_MIN_SHOTS скринов -> отчёт НЕ засчитан."""
+    k = _report_shots_count(status)
+    if k is not None and k < REPORT_MIN_SHOTS:
+        return (
+            "не засчитан (мало скринов: " + str(k) + " " + plural_screens(k)
+            + ", нужно от " + str(REPORT_MIN_SHOTS) + ")"
+        )
+    return status
 def _points_for_shots(k):
     """Норма: < REPORT_MIN_SHOTS скринов -> 0; >= REPORT_FULL_SHOTS -> полный балл, иначе частичный. Без отчёта -> 0."""
     if not k or k < REPORT_MIN_SHOTS:
@@ -2211,7 +2220,7 @@ def finalize_page_results(peer_id, st):
             # повторная проверка за тот же день: после метки от игрока ничего нет
             if old_status:
                 status = old_status
-                out_lines.append(nick + " " + status + " (уже проверен)")
+                out_lines.append(nick + " " + _shot_status_display(status) + " (уже проверен)")
             else:
                 status = "нет отчета"
                 out_lines.append(nick + " " + status)
@@ -2221,9 +2230,9 @@ def finalize_page_results(peer_id, st):
             if old_k and new_k:
                 total_k = old_k + new_k
                 status = "есть отчет " + str(total_k) + " " + plural_screens(total_k)
-                out_lines.append(nick + " " + status + " (+" + str(new_k) + " после прошлой проверки)")
+                out_lines.append(nick + " " + _shot_status_display(status) + " (+" + str(new_k) + " после прошлой проверки)")
             else:
-                out_lines.append(nick + " " + status)
+                out_lines.append(nick + " " + _shot_status_display(status))
         saved[nick] = status
     with lock:
         PAGE_STATE.pop(peer_id, None)
@@ -3565,8 +3574,10 @@ ADMIN_HELP = (
     "/отчеты дд.мм.гггг — проверка отчётов для /список (общие админы)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня из обсуждений\n"
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
-    "💡 После проверки бот предложит выдать баллы (12+ скринов = 10 баллов, меньше = 7) и сделать рассылку игрокам. "
-    "\nПри повторной проверке баллы повторно не выдаются — доначисляется только разница.\n\n"
+    "💡 После проверки бот предложит выдать баллы (10+ скринов = 10 баллов, 6-9 = 7).\n"
+    "4-5 скринов: бот покажет их и спросит, выдавать ли 7 баллов.\n"
+    "Меньше 4 скринов — отчёт не засчитывается (0 баллов).\n"
+    "При повторной проверке баллы повторно не выдаются — доначисляется только разница.\n\n"
     "Отгул и отпуск теперь выдаёт только админ — в магазине эти товары убраны. "
     "Время считается по МСК."
 )
@@ -3597,7 +3608,9 @@ NADMIN_HELP = (
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня\n"
     "/отместо — показать где проверяются отчёты\n"
-    "💡 После проверки бот спросит про выдачу баллов (12+ скринов = 10, меньше = 7) и рассылку. Доначисляется только разница.\n"
+    "💡 После проверки бот спросит про выдачу баллов (10+ скринов = 10, 6-9 = 7) и рассылку.\n"
+    "4-5 скринов: сначала общая выдача, затем бот покажет скрины такого игрока и спросит, выдавать ли ему 7 баллов.\n"
+    "Меньше 4 скринов — отчёт не засчитывается (0 баллов). Доначисляется только разница.\n"
 )
 def cmd_help(user_id):
     if user_id in ALLOWED_IDS:
