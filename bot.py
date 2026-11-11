@@ -948,15 +948,32 @@ def cmd_sms(args, is_common, admin_id):
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
 def reply(peer_id, text, keyboard=None, attachment=None):
+    """Отправляет сообщение и возвращает его ID (None — если не удалось)."""
     try:
         params = {"peer_id": peer_id, "message": str(text), "random_id": get_random_id()}
         if keyboard:
             params["keyboard"] = keyboard
         if attachment:
             params["attachment"] = attachment
-        vk.messages.send(**params)
+        return vk.messages.send(**params)
     except Exception as e:
         print("Ошибка отправки сообщения:", repr(e))
+        return None
+def edit_message(peer_id, message_id, text, keyboard=None):
+    """Редактирует сообщение бота. keyboard=None -> кнопки убираются совсем."""
+    if not message_id:
+        return False
+    try:
+        vk.messages.edit(
+            peer_id=peer_id,
+            message_id=int(message_id),
+            message=str(text),
+            keyboard=keyboard if keyboard else "",
+        )
+        return True
+    except Exception as e:
+        print("Ошибка редактирования сообщения:", repr(e))
+        return False
 def split_long_text(text, limit=3800):
     """Режет длинный текст по строкам на куски до limit символов."""
     chunks = []
@@ -1994,7 +2011,7 @@ def cmd_reports_start(date_str, n, peer_id):
         if PAGE_STATE:
             return "⏳ Проверка отчётов уже идёт, подождите её окончания."
         # новый запуск проверки отменяет прежние вопросы «выдать баллы / рассылку» в этом чате
-        REPORT_AWAIT.pop(peer_id, None)
+        old_ask = REPORT_AWAIT.pop(peer_id, None)
         PAGE_STATE[peer_id] = {
             "stage": "waiting_list",
             "n": n,
@@ -2006,6 +2023,8 @@ def cmd_reports_start(date_str, n, peer_id):
             "parts": {},
             "total": 0,
         }
+    if old_ask:
+        close_question(peer_id, old_ask, "⏭ Вопрос отменён: запущена новая проверка.")
     # убеждаемся, что страничный бот слушает
     if not (PAGE_THREAD and PAGE_THREAD.is_alive()):
         start_page_bot()
@@ -2112,17 +2131,42 @@ def _points_for_shots(k):
         return 0
     return REPORT_FULL_POINTS if k >= REPORT_FULL_SHOTS else REPORT_PART_POINTS
 def yes_no_keyboard(action):
-    """Клавиатура «Да / Нет» для вопроса в чате. action — что произойдёт при нажатии «Да»."""
-    kb = VkKeyboard(one_time=False)
+    """Инлайн-клавиатура «Да / Нет» — кнопки внутри сообщения бота."""
+    kb = VkKeyboard(inline=True)
     btn(kb, "✅ Да", "rep_answer", VkKeyboardColor.POSITIVE, a=action, v="yes")
     btn(kb, "❌ Нет", "rep_answer", VkKeyboardColor.NEGATIVE, a=action, v="no")
     return kb.get_keyboard()
+def close_question(peer_id, st, note):
+    """Редактирует сообщение с вопросом: дописывает ответ и убирает кнопки,
+    чтобы нажать повторно было нельзя. True — сообщение обновлено."""
+    if not st or not st.get("msg_id"):
+        return False
+    base = str(st.get("question") or "").strip()
+    text = (base + "\n\n" if base else "") + note
+    if len(text) > 4000:
+        text = text[:4000]
+    return edit_message(peer_id, st["msg_id"], text)
+def hide_keyboard():
+    """Пустая клавиатура: скрывает обычное меню бота под полем ввода."""
+    return json.dumps({"one_time": True, "buttons": []}, ensure_ascii=False)
+def close_chat_questions(peer_id, note="⏹ Кнопки убраны (команда /help)."):
+    """Убирает активный вопрос с кнопками в этом чате (редактирует сообщение).
+    Возвращает True — если вопрос был и кнопки сняты."""
+    with lock:
+        st = REPORT_AWAIT.pop(peer_id, None)
+    if st is None:
+        return False
+    close_question(peer_id, st, note)
+    return True
 def _cleanup_report_await():
     """Убирает протухшие вопросы по чатам."""
     now = time.time()
+    expired = []
     for peer in list(REPORT_AWAIT.keys()):
         if now - REPORT_AWAIT[peer].get("ts", 0) > REPORT_AWAIT_TIMEOUT:
-            REPORT_AWAIT.pop(peer, None)
+            expired.append((peer, REPORT_AWAIT.pop(peer, None)))
+    for peer, st in expired:
+        close_question(peer, st, "⌛ Вопрос устарел — ответ не принят.")
 def _report_state(peer_id):
     """Текущий вопрос по этому чату (или None, если его нет/он устарел)."""
     _cleanup_report_await()
@@ -2203,11 +2247,6 @@ def finalize_page_results(peer_id, st):
         else:
             reply(peer_id, "💭 Принятых отчётов нет — выдавать баллы некому.")
         return
-    with lock:
-        REPORT_AWAIT[peer_id] = {
-            "stage": "ask_points", "n": n, "date": date_str,
-            "plan": plan, "awarded": [], "ts": time.time(),
-        }
     lines_q = ["💰 Выдать баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + ")?"]
     for item in plan:
         given = int(already_map.get(item["nick"]) or 0)
@@ -2219,7 +2258,14 @@ def finalize_page_results(peer_id, st):
     lines_q.append(
         "Итого: " + str(len(plan)) + " игрокам, " + str(sum(i["delta"] for i in plan)) + " баллов."
     )
-    reply(peer_id, "\n".join(lines_q), yes_no_keyboard("points"))
+    q_text = "\n".join(lines_q)
+    q_id = reply(peer_id, q_text, yes_no_keyboard("points"))
+    with lock:
+        REPORT_AWAIT[peer_id] = {
+            "stage": "ask_points", "n": n, "date": date_str,
+            "plan": plan, "awarded": [], "ts": time.time(),
+            "msg_id": q_id, "question": q_text,
+        }
 def award_report_points(peer_id, st):
     """Выдаёт баллы по плану проверки. Возвращает (текст, клавиатура)."""
     n = st.get("n", 2)
@@ -2260,11 +2306,6 @@ def award_report_points(peer_id, st):
         if missed:
             text += "\nНе найдены: " + ", ".join(missed)
         return text, None
-    with lock:
-        REPORT_AWAIT[peer_id] = {
-            "stage": "ask_broadcast", "n": n, "date": date_str,
-            "awarded": awarded, "ts": time.time(),
-        }
     lines = ["💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):"]
     for a in awarded:
         is_bonus = a["pts"] < a["norm"]
@@ -2274,7 +2315,14 @@ def award_report_points(peer_id, st):
         lines.append("⚠️ Не найден: " + ", ".join(missed))
     lines.append("")
     lines.append("📣 Делаем рассылку о выдаче баллов?")
-    return "\n".join(lines), yes_no_keyboard("broadcast")
+    q_text = "\n".join(lines)
+    with lock:
+        REPORT_AWAIT[peer_id] = {
+            "stage": "ask_broadcast", "n": n, "date": date_str,
+            "awarded": awarded, "ts": time.time(),
+            "msg_id": None, "question": q_text,
+        }
+    return q_text, yes_no_keyboard("broadcast")
 def broadcast_report_points(peer_id, st):
     """Пишет каждому награждённому игроку в ЛС о начисленных баллах."""
     n = st.get("n", 2)
@@ -2320,11 +2368,17 @@ def report_answer_response(user_id, peer_id, payload):
         with lock:
             REPORT_AWAIT.pop(peer_id, None)
         if action == "broadcast":
-            return "❌ Ок, рассылку не делаю.", None
-        return "❌ Ок, баллы не выдаю.", None
+            if not close_question(peer_id, st, "❌ Ответ: Нет — рассылку не делаю."):
+                return "❌ Ок, рассылку не делаю.", None
+            return None
+        if not close_question(peer_id, st, "❌ Ответ: Нет — баллы не выдаю."):
+            return "❌ Ок, баллы не выдаю.", None
+        return None
     if action == "points":
+        close_question(peer_id, st, "✅ Ответ: Да — выдаю баллы.")
         return award_report_points(peer_id, st)
     if action == "broadcast":
+        close_question(peer_id, st, "✅ Ответ: Да — делаю рассылку.")
         return broadcast_report_points(peer_id, st)
     return "Неизвестное действие.", None
 # ==========================================================
@@ -3680,7 +3734,7 @@ def get_help_photo(kind):
         except Exception as e:
             print("Не удалось создать/загрузить картинку-справку '" + kind + "':", repr(e))
             return None
-def send_admin_help(peer_id, user_id):
+def send_admin_help(peer_id, user_id, keyboard=None):
     """Админам: картинка со всеми командами + пояснения текстом под ней."""
     if user_id in ALLOWED_IDS:
         kind, caption, fallback = "admin", ADMIN_CAPTION, ADMIN_HELP
@@ -3691,18 +3745,24 @@ def send_admin_help(peer_id, user_id):
         if not attachment:
             break
         try:
-            vk.messages.send(
-                peer_id=peer_id,
-                message=caption,
-                attachment=attachment,
-                random_id=get_random_id(),
-            )
+            params = {
+                "peer_id": peer_id,
+                "message": caption,
+                "attachment": attachment,
+                "random_id": get_random_id(),
+            }
+            if keyboard:
+                params["keyboard"] = keyboard
+            vk.messages.send(**params)
             return
         except Exception as e:
             print("Ошибка отправки картинки-справки:", repr(e))
             with help_lock:
                 HELP_PHOTO.pop(kind, None)  # перезагрузим картинку заново
-    reply(peer_id, fallback)
+    params = {"peer_id": peer_id, "message": fallback, "random_id": get_random_id()}
+    if keyboard:
+        params["keyboard"] = keyboard
+    vk.messages.send(**params)
 # ==========================================================
 # РАЗБОР КОМАНД С НОМЕРОМ СПИСКА (/привязать1, /привязать2 ...)
 # ==========================================================
@@ -3936,7 +3996,13 @@ def process_event(event):
             result = "Произошла ошибка. Попробуйте позже.", None
         if result is not None:
             answer, kb = result
-            reply(peer_id, answer, kb)
+            new_id = reply(peer_id, answer, kb)
+            # сохраняем ID нового вопроса, чтобы потом убрать кнопки
+            if kb and new_id:
+                with lock:
+                    st = REPORT_AWAIT.get(peer_id)
+                    if st is not None:
+                        st["msg_id"] = new_id
         return
 
     # === Нажатия на кнопки (только ЛС) ===
@@ -4018,22 +4084,27 @@ def process_event(event):
     command, suffix = split_command(raw_cmd)
 
     # /help и /хелп: админам (полный доступ и /вдв) — картинка + пояснения
+    # Заодно снимаем все кнопки в этом чате (вопросы по отчётам и меню-клавиатуру).
     if raw_cmd in ("/help", "/хелп") and is_any_admin(from_id):
+        close_chat_questions(peer_id)
         try:
-            send_admin_help(peer_id, from_id)
+            send_admin_help(peer_id, from_id, hide_keyboard())
         except Exception as e:
             print("Ошибка справки:", repr(e))
-            reply(peer_id, cmd_help(from_id))
+            reply(peer_id, cmd_help(from_id), hide_keyboard())
         return
 
     is_public = True
     public_answer = None
+    public_keyboard = None
     try:
         if command == "/баллы":
             n = public_ctx(from_id, suffix)
             public_answer = "Формат: /баллы" if args else cmd_points(from_id, n)
         elif raw_cmd in ("/help", "/хелп"):
+            close_chat_questions(peer_id)
             public_answer = cmd_help(from_id)
+            public_keyboard = hide_keyboard()
         elif command == "/магазин":
             public_answer = cmd_shop(public_ctx(from_id, suffix))
         elif command == "/купить":
@@ -4055,7 +4126,7 @@ def process_event(event):
         public_answer = "Произошла ошибка. Попробуйте позже."
     if is_public:
         if public_answer:
-            reply(peer_id, public_answer)
+            reply(peer_id, public_answer, public_keyboard)
         return
     # ======================================================
     # ВСЕ ОСТАЛЬНЫЕ КОМАНДЫ — только админы (общие или /вдв)
