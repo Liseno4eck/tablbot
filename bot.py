@@ -57,8 +57,11 @@ PURCHASE_HISTORY_LIMIT = 200
 FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 # ==========================================================
 # НОРМА ОТЧЁТОВ: сколько скринов и сколько баллов выдавать
+#   <  REPORT_MIN_SHOTS скринов  -> баллов НЕ выдаём (0)
+#   в REPORT_CHECK_SHOTS скринов -> REPORT_PART_POINTS, НО только после
+#      проверки: бот предлагает показать скрины и затем спрашивает, выдавать ли
 #   >= REPORT_FULL_SHOTS скринов -> REPORT_FULL_POINTS баллов
-#   от 1 до REPORT_FULL_SHOTS-1  -> REPORT_PART_POINTS баллов
+#   от REPORT_MIN_SHOTS до REPORT_FULL_SHOTS-1 -> REPORT_PART_POINTS баллов
 #   0 скринов / отгул / отпуск   -> баллы не выдаются
 #   Повторная проверка за тот же день: выдаётся только РАЗНИЦА между новой
 #   нормой и тем, что уже было выдано (переплата невозможна).
@@ -66,6 +69,8 @@ FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 REPORT_FULL_SHOTS = 12
 REPORT_FULL_POINTS = 10
 REPORT_PART_POINTS = 7
+REPORT_MIN_SHOTS = 4          # меньше 4 скринов — 0 баллов
+REPORT_CHECK_SHOTS = (4, 5)   # 4-5 скринов — 7 баллов, но только после показа скринов и подтверждения
 # ==========================================================
 # СТРАНИЧНЫЙ БОТ (аккаунт пользователя, подключённый командой +токен)
 # ==========================================================
@@ -948,10 +953,12 @@ def cmd_sms(args, is_common, admin_id):
 # ОТПРАВКА СООБЩЕНИЙ
 # ==========================================================
 def reply(peer_id, text, keyboard=None, attachment=None):
-    """Отправляет сообщение и возвращает его ID (None — если не удалось)."""
+    """Отправляет сообщение и возвращает его ID (None — если не удалось).
+    keyboard=None -> без клавиатуры, keyboard="" -> убрать клавиатуру,
+    keyboard=JSON -> установить клавиатуру."""
     try:
         params = {"peer_id": peer_id, "message": str(text), "random_id": get_random_id()}
-        if keyboard:
+        if keyboard is not None:
             params["keyboard"] = keyboard
         if attachment:
             params["attachment"] = attachment
@@ -968,7 +975,7 @@ def edit_message(peer_id, message_id, text, keyboard=None):
             peer_id=peer_id,
             message_id=int(message_id),
             message=str(text),
-            keyboard=keyboard if keyboard else "",
+            keyboard=keyboard if keyboard is not None else hide_inline_keyboard(),
         )
         return True
     except Exception as e:
@@ -2126,8 +2133,8 @@ def _report_shots_count(status):
     m = re.search(r"есть\s+отч[её]т\s+(\d+)", (status or "").lower())
     return int(m.group(1)) if m else None
 def _points_for_shots(k):
-    """Норма: >= REPORT_FULL_SHOTS скринов -> полный балл, иначе частичный. Без отчёта -> 0."""
-    if not k:
+    """Норма: < REPORT_MIN_SHOTS скринов -> 0; >= REPORT_FULL_SHOTS -> полный балл, иначе частичный. Без отчёта -> 0."""
+    if not k or k < REPORT_MIN_SHOTS:
         return 0
     return REPORT_FULL_POINTS if k >= REPORT_FULL_SHOTS else REPORT_PART_POINTS
 def yes_no_keyboard(action):
@@ -2147,8 +2154,11 @@ def close_question(peer_id, st, note):
         text = text[:4000]
     return edit_message(peer_id, st["msg_id"], text)
 def hide_keyboard():
-    """Пустая клавиатура: скрывает обычное меню бота под полем ввода."""
+    """Пустой набор кнопок: VK по нему убирает обычное меню под полем ввода."""
     return json.dumps({"one_time": True, "buttons": []}, ensure_ascii=False)
+def hide_inline_keyboard():
+    """Пустой набор inline-кнопок: убирает кнопки внутри сообщения."""
+    return json.dumps({"inline": True, "buttons": []}, ensure_ascii=False)
 def close_chat_questions(peer_id, note="⏹ Кнопки убраны (команда /help)."):
     """Убирает активный вопрос с кнопками в этом чате (редактирует сообщение).
     Возвращает True — если вопрос был и кнопки сняты."""
@@ -2238,17 +2248,25 @@ def finalize_page_results(peer_id, st):
         if delta <= 0:
             skipped_awarded.append(nick)
             continue
-        plan.append({"nick": nick, "delta": delta, "norm": pts, "shots": k})
-    if not plan:
-        with lock:
-            REPORT_AWAIT.pop(peer_id, None)
-        if skipped_awarded:
+        plan.append({
+            "nick": nick, "delta": delta, "norm": pts, "shots": k,
+            "check": k in REPORT_CHECK_SHOTS,
+        })
+    auto = [i for i in plan if not i["check"]]
+    review = [i for i in plan if i["check"]]
+    if not auto:
+        # выдавать сразу нечего — сразу начинаем цепочку проверки (4 скрина)
+        if not review and skipped_awarded:
             reply(peer_id, "✅ Баллы за " + date_str + " уже были выданы: " + ", ".join(skipped_awarded) + ".")
-        else:
+        elif not review:
             reply(peer_id, "💭 Принятых отчётов нет — выдавать баллы некому.")
+        else:
+            with lock:
+                REPORT_AWAIT.pop(peer_id, None)
+            _begin_review(peer_id, {"n": n, "date": date_str, "plan": [], "review": review, "awarded": []})
         return
     lines_q = ["💰 Выдать баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + ")?"]
-    for item in plan:
+    for item in auto:
         given = int(already_map.get(item["nick"]) or 0)
         note = ""
         if given > 0:
@@ -2256,73 +2274,204 @@ def finalize_page_results(peer_id, st):
         lines_q.append("• " + item["nick"] + " — +" + str(item["delta"]) + note)
     lines_q.append("")
     lines_q.append(
-        "Итого: " + str(len(plan)) + " игрокам, " + str(sum(i["delta"] for i in plan)) + " баллов."
+        "Итого: " + str(len(auto)) + " игрокам, " + str(sum(i["delta"] for i in auto)) + " баллов."
     )
+    if review:
+        lines_q.append("")
+        lines_q.append(
+            "🔎 У " + ", ".join(i["nick"] for i in review) + " по "
+            + str(min(REPORT_CHECK_SHOTS)) + "-" + str(max(REPORT_CHECK_SHOTS)) + " "
+            + plural_screens(max(REPORT_CHECK_SHOTS))
+            + " — перед выдачей покажу их скрины и спрошу подтверждение отдельно."
+        )
     q_text = "\n".join(lines_q)
     q_id = reply(peer_id, q_text, yes_no_keyboard("points"))
     with lock:
         REPORT_AWAIT[peer_id] = {
             "stage": "ask_points", "n": n, "date": date_str,
-            "plan": plan, "awarded": [], "ts": time.time(),
+            "plan": auto, "review": review, "awarded": [], "ts": time.time(),
             "msg_id": q_id, "question": q_text,
         }
-def award_report_points(peer_id, st):
-    """Выдаёт баллы по плану проверки. Возвращает (текст, клавиатура)."""
-    n = st.get("n", 2)
-    date_str = st.get("date", "")
-    plan = st.get("plan") or []
-    awarded = []
-    missed = []
+def _grant_one(n, date_str, item):
+    """Выдаёт баллы одному игроку. Возвращает (awarded|None, missed_nick|None)."""
     with lock:
-        for item in plan:
-            nick = str(item.get("nick") or "")
-            delta = int(item.get("delta", 0) or 0)
-            norm = int(item.get("norm", 0) or 0)
-            player = find_by_nick(n, nick) if nick else None
-            if player is None or delta <= 0:
-                if nick:
-                    missed.append(nick)
-                continue
-            player["points"] += delta
-            contest_record(n, player, delta)
-            awarded.append({
-                "nick": player["nick"], "vk_id": player["vk_id"],
-                "pts": delta, "norm": norm, "total": player["points"],
-            })
-        if awarded:
-            # запоминаем суммарно выданную за эту дату норму, чтобы не выдать дважды
-            awarded_store = data.setdefault("points_awarded", {})
-            day = awarded_store.setdefault(date_str, {})
-            already = day.setdefault(str(n), {})
-            for a in awarded:
-                prev = already.get(a["nick"])
-                prev = int(prev) if isinstance(prev, int) else 0
-                already[a["nick"]] = max(prev, a["norm"])
-            save_data()
-    if not awarded:
+        nick = str(item.get("nick") or "")
+        delta = int(item.get("delta", 0) or 0)
+        norm = int(item.get("norm", 0) or 0)
+        player = find_by_nick(n, nick) if nick else None
+        if player is None or delta <= 0:
+            return None, (nick or None)
+        player["points"] += delta
+        contest_record(n, player, delta)
+        awarded = {
+            "nick": player["nick"], "vk_id": player["vk_id"],
+            "pts": delta, "norm": norm, "total": player["points"],
+        }
+        # запоминаем суммарно выданную за эту дату норму, чтобы не выдать дважды
+        awarded_store = data.setdefault("points_awarded", {})
+        day = awarded_store.setdefault(date_str, {})
+        already = day.setdefault(str(n), {})
+        prev = already.get(awarded["nick"])
+        prev = int(prev) if isinstance(prev, int) else 0
+        already[awarded["nick"]] = max(prev, norm)
+        save_data()
+        return awarded, None
+def _ask_show_question(st):
+    """Вопрос «показать скрины?» для первого из очереди на проверку (4-5 скринов)."""
+    item = st["review"][0]
+    q = (
+        "🔎 У " + item["nick"] + " " + str(item["shots"]) + " " + plural_screens(item["shots"])
+        + " (норма " + str(item["norm"]) + " баллов — выдам только после показа и подтверждения).\n"
+        + "Показать его скрины?"
+    )
+    st["stage"] = "ask_show"
+    st["question"] = q
+    return q, yes_no_keyboard("show")
+def _begin_review(peer_id, base):
+    """Запускает цепочку «показать скрины -> выдать?» без основного вопроса."""
+    base["ts"] = time.time()
+    base["plan"] = []
+    q, kb = _ask_show_question(base)
+    q_id = reply(peer_id, q, kb)
+    base["msg_id"] = q_id
+    with lock:
+        REPORT_AWAIT[peer_id] = base
+def _advance_review(peer_id, st):
+    """Следующий шаг цепочки проверки: новый вопрос, рассылка или завершение."""
+    st["msg_id"] = None
+    if st.get("review"):
+        q, kb = _ask_show_question(st)
+    elif st.get("awarded"):
+        q, kb = _broadcast_question(st)
+    else:
         with lock:
             REPORT_AWAIT.pop(peer_id, None)
-        text = "❌ Не удалось выдать баллы: никто из списка не найден."
-        if missed:
-            text += "\nНе найдены: " + ", ".join(missed)
-        return text, None
+        return "✅ Проверка завершена — баллов не выдавали.", None
+    with lock:
+        st["ts"] = time.time()
+        REPORT_AWAIT[peer_id] = st
+    return q, kb
+def _broadcast_question(st):
+    """Вопрос про рассылку (после всех выдач)."""
+    awarded = st.get("awarded") or []
+    date_str = st.get("date", "")
+    n = st.get("n", 2)
     lines = ["💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):"]
     for a in awarded:
         is_bonus = a["pts"] < a["norm"]
         tag = " (доначислено)" if is_bonus else ""
         lines.append("• " + a["nick"] + " +" + str(a["pts"]) + " (теперь " + str(a["total"]) + ")" + tag)
-    if missed:
-        lines.append("⚠️ Не найден: " + ", ".join(missed))
     lines.append("")
     lines.append("📣 Делаем рассылку о выдаче баллов?")
     q_text = "\n".join(lines)
-    with lock:
-        REPORT_AWAIT[peer_id] = {
-            "stage": "ask_broadcast", "n": n, "date": date_str,
-            "awarded": awarded, "ts": time.time(),
-            "msg_id": None, "question": q_text,
-        }
+    st["stage"] = "ask_broadcast"
+    st["question"] = q_text
     return q_text, yes_no_keyboard("broadcast")
+def _request_review_shots(peer_id, st):
+    """Просит страничный бот прислать скрины проверяемого игрока. Возвращает (текст, клавиатура)."""
+    item = st["review"][0]
+    n = st.get("n", 2)
+    page_uid = get_page_user_id()
+    if not page_uid or not is_page_connected():
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        return "❌ Страничный бот не подключён — скрины показать не могу.", None
+    with lock:
+        player = find_by_nick(n, item["nick"])
+        for key, s in list(SHOTS_STATE.items()):
+            if time.time() - s.get("ts", 0) > SHOTS_TIMEOUT:
+                del SHOTS_STATE[key]
+        if SHOTS_STATE:
+            with lock:
+                REPORT_AWAIT.pop(peer_id, None)
+            return "⏳ Сейчас идёт другой сбор скринов — проверка остановлена. Дождитесь и запустите /отчеты заново.", None
+        if player is None:
+            st["review"].pop(0)
+            note = "⚠️ Игрок " + item["nick"] + " не найден в списке " + LIST_TITLE[n] + " — пропускаю."
+            q, kb = _advance_review(peer_id, st)
+            return note + "\n\n" + q, kb
+        SHOTS_STATE[peer_id] = {
+            "user_id": page_uid, "peer_id": peer_id, "nick": item["nick"],
+            "vk_id": player["vk_id"], "lists": [n], "ts": time.time(),
+            "parts": {}, "total": 0, "after": "review",
+        }
+        st["stage"] = "waiting_shots"
+        st["msg_id"] = None
+        st["ts"] = time.time()
+        REPORT_AWAIT[peer_id] = st
+    if not send_to_page(page_uid, "/скрины " + str(player["vk_id"]) + " " + str(n)):
+        with lock:
+            SHOTS_STATE.pop(peer_id, None)
+            REPORT_AWAIT.pop(peer_id, None)
+        return "❌ Не удалось написать страничному боту — проверка остановлена.", None
+    return "🔎 Ищу скрины " + item["nick"] + ", ждите...", None
+def _review_shots_done(peer_id, note):
+    """Скрины показаны (или не найдены) — спрашиваем, выдавать ли баллы этому игроку."""
+    with lock:
+        st = REPORT_AWAIT.get(peer_id)
+        if st is None or st.get("stage") != "waiting_shots" or not st.get("review"):
+            return
+        item = st["review"][0]
+        q = (
+            note + "\n\n💰 Выдать " + item["nick"] + " " + str(item["delta"])
+            + " баллов за отчёт за " + st.get("date", "") + " (" + LIST_TITLE[st.get("n", 2)] + ")?"
+        )
+        st["stage"] = "ask_give"
+        st["question"] = q
+        st["ts"] = time.time()
+        q_id = reply(peer_id, q, yes_no_keyboard("give"))
+        st["msg_id"] = q_id
+def _review_give(peer_id, st, approve):
+    """Итог вопроса «выдать баллы проверяемому игроку?» и переход к следующему шагу."""
+    item = st["review"].pop(0)
+    if not approve:
+        note = "❌ Ок, " + item["nick"] + " баллы не выдаю."
+    else:
+        awarded, missed = _grant_one(st.get("n", 2), st.get("date", ""), item)
+        if awarded is None:
+            note = "⚠️ Не удалось выдать баллы: игрок " + str(missed or item["nick"]) + " не найден."
+        else:
+            st["awarded"] = (st.get("awarded") or []) + [awarded]
+            note = ("✅ Выдал " + awarded["nick"] + " +" + str(awarded["pts"])
+                    + " баллов (теперь " + str(awarded["total"]) + ").")
+    q, kb = _advance_review(peer_id, st)
+    return note + "\n\n" + q, kb
+def award_report_points(peer_id, st):
+    """Выдаёт баллы по основному плану. Дальше — цепочка проверки (4-5 скринов) или рассылка."""
+    n = st.get("n", 2)
+    date_str = st.get("date", "")
+    plan = st.get("plan") or []
+    awarded = []
+    missed = []
+    for item in plan:
+        a, m = _grant_one(n, date_str, item)
+        if a is not None:
+            awarded.append(a)
+        elif m:
+            missed.append(m)
+    st["awarded"] = (st.get("awarded") or []) + awarded
+    lines = []
+    if awarded:
+        lines.append("💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):")
+        for a in awarded:
+            is_bonus = a["pts"] < a["norm"]
+            tag = " (доначислено)" if is_bonus else ""
+            lines.append("• " + a["nick"] + " +" + str(a["pts"]) + " (теперь " + str(a["total"]) + ")" + tag)
+    if missed:
+        lines.append("⚠️ Не найден: " + ", ".join(missed))
+    if st.get("review"):
+        # сначала проверка игроков с 4-5 скринами, рассылка — после неё
+        if not lines:
+            lines.append("💭 По основному плану выдавать нечего — перехожу к проверке 4-5 скринов.")
+        lines.append("")
+        q, kb = _ask_show_question(st)
+        return "\n".join(lines) + "\n" + q, kb
+    if not st.get("awarded"):
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        text = "\n".join(lines) if lines else "❌ Не удалось выдать баллы: никто из списка не найден."
+        return text, None
+    return _broadcast_question(st)
 def broadcast_report_points(peer_id, st):
     """Пишет каждому награждённому игроку в ЛС о начисленных баллах."""
     n = st.get("n", 2)
@@ -2353,7 +2502,7 @@ def broadcast_report_points(peer_id, st):
         lines.append("⚠️ Не дошло: " + ", ".join(failed))
     return "\n".join(lines), None
 def report_answer_response(user_id, peer_id, payload):
-    """Нажатие «Да/Нет» под вопросом бота по отчётам. Возвращает (текст, клавиатура)."""
+    """Нажатие «Да/Нет» под вопросом бота по отчётам. Возвращает (текст, клавиатура) или None."""
     if user_id not in ALLOWED_IDS and user_id not in NADMIN_IDS:
         return None
     action = str(payload.get("a") or "")
@@ -2362,8 +2511,26 @@ def report_answer_response(user_id, peer_id, payload):
     if st is None:
         return "Этот вопрос уже не актуален — запустите проверку заново (/от или /отчеты).", None
     stage = st.get("stage")
-    if (action == "points" and stage != "ask_points") or (action == "broadcast" and stage != "ask_broadcast"):
+    need_stage = {"points": "ask_points", "broadcast": "ask_broadcast",
+                  "show": "ask_show", "give": "ask_give"}.get(action)
+    if need_stage is None or stage != need_stage:
         return "На этот вопрос уже ответили. Новых вопросов нет.", None
+    if action == "show":
+        if value == "yes":
+            close_question(peer_id, st, "✅ Ответ: Да — показываю скрины.")
+            return _request_review_shots(peer_id, st)
+        item = st["review"].pop(0)
+        close_question(peer_id, st, "❌ Ответ: Нет — скрины не показываю, баллы не выдаю.")
+        if st.get("review") or st.get("awarded"):
+            q, kb = _advance_review(peer_id, st)
+            return "❌ Ок, " + item["nick"] + " баллы не выдаю (скрины не смотрели).\n\n" + q, kb
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        return "❌ Ок, скрины не показываю, баллы не выдаю.", None
+    if action == "give":
+        close_question(peer_id, st, "✅ Ответ: Да — выдаю баллы." if value == "yes"
+                       else "❌ Ответ: Нет — баллы не выдаю.")
+        return _review_give(peer_id, st, value == "yes")
     if value == "no":
         with lock:
             REPORT_AWAIT.pop(peer_id, None)
@@ -2539,13 +2706,18 @@ def handle_page_shots(msg):
     if text.startswith("ОШИБКА"):
         with lock:
             SHOTS_STATE.pop(peer_id, None)
-        reply(peer_id, "❌ Страничный бот: " + text[len("ОШИБКА"):].strip(": \n"))
+        err = text[len("ОШИБКА"):].strip(": \n")
+        reply(peer_id, "❌ Страничный бот: " + err)
+        if st.get("after") == "review":
+            _review_shots_done(peer_id, "⚠️ Скрины показать не удалось (" + err + ").")
         return True
 
     if text.startswith("СКРИНЫ_НЕТ"):
         with lock:
             SHOTS_STATE.pop(peer_id, None)
         reply(peer_id, "📭 У " + st["nick"] + " нет скринов за сегодня (" + today_local().strftime("%d.%m.%Y") + ").")
+        if st.get("after") == "review":
+            _review_shots_done(peer_id, "📭 Скринов за сегодня не нашлось.")
         return True
 
     m = re.match(r"СКРИНЫ\s+(\d+)/(\d+)", text)
@@ -2571,12 +2743,19 @@ def handle_page_shots(msg):
                     all_items.append((att, url))
         if not all_items:
             reply(peer_id, "📭 У " + st["nick"] + " нет скринов за сегодня.")
+            if st.get("after") == "review":
+                _review_shots_done(peer_id, "📭 Скринов не нашлось.")
             return True
         header = (
             "📸 Скрины " + st["nick"] + " за " + today_local().strftime("%d.%m.%Y")
             + " (" + ", ".join(LIST_TITLE[x] for x in st["lists"]) + "): " + str(len(all_items))
         )
         _send_shots(peer_id, header, all_items)
+        if st.get("after") == "review":
+            _review_shots_done(
+                peer_id,
+                "📸 Показал скрины " + st["nick"] + ": " + str(len(all_items)) + " шт. (см. выше).",
+            )
     return True
 # ==========================================================
 # ОТЧЁТЫ: сторона СТРАНИЧНОГО БОТА (аккаунт пользователя, longpoll по user-токену)
