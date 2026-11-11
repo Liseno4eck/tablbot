@@ -56,6 +56,17 @@ PURCHASE_HISTORY_LIMIT = 200
 # Папка для шрифтов (для картинки-справки)
 FONT_DIR = os.environ.get("FONT_DIR", "fonts")
 # ==========================================================
+# НОРМА ОТЧЁТОВ: сколько скринов и сколько баллов выдавать
+#   >= REPORT_FULL_SHOTS скринов -> REPORT_FULL_POINTS баллов
+#   от 1 до REPORT_FULL_SHOTS-1  -> REPORT_PART_POINTS баллов
+#   0 скринов / отгул / отпуск   -> баллы не выдаются
+#   Повторная проверка за тот же день: выдаётся только РАЗНИЦА между новой
+#   нормой и тем, что уже было выдано (переплата невозможна).
+# ==========================================================
+REPORT_FULL_SHOTS = 12
+REPORT_FULL_POINTS = 10
+REPORT_PART_POINTS = 7
+# ==========================================================
 # СТРАНИЧНЫЙ БОТ (аккаунт пользователя, подключённый командой +токен)
 # ==========================================================
 PAGE_TOKEN = None        # токен страничного бота
@@ -71,11 +82,17 @@ PAGE_NICKS_GIST = "nicks_reports.json"
 PAGE_GEN = 0             # «поколение» страничного бота: при смене токена старый поток сам завершается
 PAGE_THREAD = None
 PAGE_JOB = None          # текущая задача страничного бота (сторона страничного бота)
+# Ожидаем нажатие кнопки в чате: peer_id -> {"stage", "n", "date", "lines", ...}
+REPORT_AWAIT = {}
+REPORT_AWAIT_TIMEOUT = 1800
 page_lock = threading.Lock()
 PAGE_TIMEOUT = 240       # сколько секунд ждём результат проверки
 # ==========================================================
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
+# Метка, которую страничный бот пишет в обсуждении после проверки.
+# При повторной проверке за тот же день учитываются только комментарии ПОСЛЕ неё.
+MARKER_TEXT = "все выше отчеты проверены"
 # ID сообщества, в котором игроки скидывают отчёты.
 REPORT_GROUP_ID = int(os.environ.get("REPORT_GROUP_ID", "0") or 0)
 # Обсуждение, где проверяются отчёты для /от  (список /нлист)
@@ -133,6 +150,8 @@ data = {
     "report_settings": {"group_id": 0, "topic_ot": 0, "topic_otchety": 0},
     # отчёты: "дд.мм.гггг" -> {list_type: {nick: статус}}
     "reports": {},
+    # кому уже выдали баллы за отчёт: "дд.мм.гггг" -> {list_type: {nick: сколько выдано}}
+    "points_awarded": {},
     # ники для отчётов (складываются в Gist)
     "report_nicks": {},
     # конкурс: период и заработанные баллы
@@ -505,6 +524,39 @@ def _norm_reports(raw_reports):
         if entry:
             result[day] = entry
     return result
+def _norm_points_awarded(raw):
+    """"дд.мм.гггг" -> {"1": {nick: сколько баллов уже выдано}, "2": {...}}.
+    Старый формат (просто список ников) -> сумма неизвестна (None): повторно не выдаём."""
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for day, lists in raw.items():
+        day = str(day).strip()
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", day) or not isinstance(lists, dict):
+            continue
+        entry = {}
+        for key in ("1", "2"):
+            block = lists.get(key)
+            nick_map = {}
+            if isinstance(block, dict):
+                for nick, pts in block.items():
+                    nick = str(nick).strip()
+                    if not nick:
+                        continue
+                    try:
+                        nick_map[nick] = int(pts)
+                    except (TypeError, ValueError):
+                        nick_map[nick] = None
+            elif isinstance(block, list):
+                for nick in block:
+                    nick = str(nick).strip()
+                    if nick:
+                        nick_map[nick] = None
+            if nick_map:
+                entry[key] = nick_map
+        if entry:
+            result[day] = entry
+    return result
 def _norm_report_settings(raw):
     """Настройки «где проверять отчёты»: group_id, topic_ot, topic_otchety."""
     raw = raw if isinstance(raw, dict) else {}
@@ -603,6 +655,7 @@ def _normalize_loaded(loaded):
         "report_nicks": _norm_reports(loaded.get("report_nicks")),
         "contest": _norm_contest(loaded.get("contest")),
         "last_admin_msg": _norm_last_admin_msg(loaded.get("last_admin_msg")),
+        "points_awarded": _norm_points_awarded(loaded.get("points_awarded")),
     }
 def load_data():
     local = _read_local()
@@ -644,6 +697,7 @@ def load_data():
     data["report_nicks"] = normalized["report_nicks"]
     data["contest"] = normalized["contest"]
     data["last_admin_msg"] = normalized["last_admin_msg"]
+    data["points_awarded"] = normalized["points_awarded"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -1939,6 +1993,8 @@ def cmd_reports_start(date_str, n, peer_id):
                 del PAGE_STATE[key]
         if PAGE_STATE:
             return "⏳ Проверка отчётов уже идёт, подождите её окончания."
+        # новый запуск проверки отменяет прежние вопросы «выдать баллы / рассылку» в этом чате
+        REPORT_AWAIT.pop(peer_id, None)
         PAGE_STATE[peer_id] = {
             "stage": "waiting_list",
             "n": n,
@@ -2046,25 +2102,231 @@ def handle_page_dialog(from_id, text):
             return False
         return True   # «ники получены, проверяю отчеты» и прочее — игнорируем
     return False
+def _report_shots_count(status):
+    """'есть отчет 14 скринов' -> 14. Другой статус (нет отчета/отгул/отпуск) -> None."""
+    m = re.search(r"есть\s+отч[её]т\s+(\d+)", (status or "").lower())
+    return int(m.group(1)) if m else None
+def _points_for_shots(k):
+    """Норма: >= REPORT_FULL_SHOTS скринов -> полный балл, иначе частичный. Без отчёта -> 0."""
+    if not k:
+        return 0
+    return REPORT_FULL_POINTS if k >= REPORT_FULL_SHOTS else REPORT_PART_POINTS
+def yes_no_keyboard(action):
+    """Клавиатура «Да / Нет» для вопроса в чате. action — что произойдёт при нажатии «Да»."""
+    kb = VkKeyboard(one_time=False)
+    btn(kb, "✅ Да", "rep_answer", VkKeyboardColor.POSITIVE, a=action, v="yes")
+    btn(kb, "❌ Нет", "rep_answer", VkKeyboardColor.NEGATIVE, a=action, v="no")
+    return kb.get_keyboard()
+def _cleanup_report_await():
+    """Убирает протухшие вопросы по чатам."""
+    now = time.time()
+    for peer in list(REPORT_AWAIT.keys()):
+        if now - REPORT_AWAIT[peer].get("ts", 0) > REPORT_AWAIT_TIMEOUT:
+            REPORT_AWAIT.pop(peer, None)
+def _report_state(peer_id):
+    """Текущий вопрос по этому чату (или None, если его нет/он устарел)."""
+    _cleanup_report_await()
+    with lock:
+        st = REPORT_AWAIT.get(peer_id)
+        if st is not None:
+            st["ts"] = time.time()
+    return st
 def finalize_page_results(peer_id, st):
-    """Публикует результаты в чат, где была введена команда, и сохраняет их."""
+    """Публикует результаты в чат, сохраняет их и спрашивает, выдавать ли баллы."""
     n = st.get("n", 2)
     date_str = st.get("date", "")
     parts = st.get("parts", {})
     body = "\n".join(parts[i] for i in sorted(parts))
     lines = [ln.strip() for ln in body.splitlines() if ln.strip()]
+    with lock:
+        prev = ((data.get("reports") or {}).get(date_str) or {}).get(str(n)) or {}
     saved = {}
+    out_lines = []
     for ln in lines:
         nick, _, status = ln.partition(" ")
-        if nick:
-            saved[nick] = status.strip()
+        nick = nick.strip()
+        status = status.strip()
+        if not nick:
+            continue
+        old_status = prev.get(nick)
+        if status.lower() == "без изменений":
+            # повторная проверка за тот же день: после метки от игрока ничего нет
+            if old_status:
+                status = old_status
+                out_lines.append(nick + " " + status + " (уже проверен)")
+            else:
+                status = "нет отчета"
+                out_lines.append(nick + " " + status)
+        else:
+            old_k = _report_shots_count(old_status)
+            new_k = _report_shots_count(status)
+            if old_k and new_k:
+                total_k = old_k + new_k
+                status = "есть отчет " + str(total_k) + " " + plural_screens(total_k)
+                out_lines.append(nick + " " + status + " (+" + str(new_k) + " после прошлой проверки)")
+            else:
+                out_lines.append(nick + " " + status)
+        saved[nick] = status
     with lock:
         PAGE_STATE.pop(peer_id, None)
         if saved:
             data.setdefault("reports", {}).setdefault(date_str, {})[str(n)] = saved
             save_data()
-    out = "📋 Отчёты за " + date_str + " (" + LIST_TITLE[n] + "):\n" + ("\n".join(lines) if lines else "пусто")
+    out = "📋 Отчёты за " + date_str + " (" + LIST_TITLE[n] + "):\n" + ("\n".join(out_lines) if out_lines else "пусто")
     reply_long(peer_id, out)
+    # считаем, кому положены баллы (повторно не выдаём тем, кому уже начисляли)
+    with lock:
+        already_map = ((data.get("points_awarded") or {}).get(date_str) or {}).get(str(n)) or {}
+    plan = []
+    skipped_awarded = []
+    for nick, status in saved.items():
+        k = _report_shots_count(status)
+        pts = _points_for_shots(k)
+        if pts <= 0:
+            continue
+        given = already_map.get(nick)
+        if nick in already_map and given is None:
+            # старый формат записи (сумма неизвестна) — повторно не выдаём
+            skipped_awarded.append(nick)
+            continue
+        given = int(given or 0)
+        delta = pts - given
+        if delta <= 0:
+            skipped_awarded.append(nick)
+            continue
+        plan.append({"nick": nick, "delta": delta, "norm": pts, "shots": k})
+    if not plan:
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        if skipped_awarded:
+            reply(peer_id, "✅ Баллы за " + date_str + " уже были выданы: " + ", ".join(skipped_awarded) + ".")
+        else:
+            reply(peer_id, "💭 Принятых отчётов нет — выдавать баллы некому.")
+        return
+    with lock:
+        REPORT_AWAIT[peer_id] = {
+            "stage": "ask_points", "n": n, "date": date_str,
+            "plan": plan, "awarded": [], "ts": time.time(),
+        }
+    lines_q = ["💰 Выдать баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + ")?"]
+    for item in plan:
+        given = int(already_map.get(item["nick"]) or 0)
+        note = ""
+        if given > 0:
+            note = " (доначисление: норма " + str(item["norm"]) + " − уже " + str(given) + ")"
+        lines_q.append("• " + item["nick"] + " — +" + str(item["delta"]) + note)
+    lines_q.append("")
+    lines_q.append(
+        "Итого: " + str(len(plan)) + " игрокам, " + str(sum(i["delta"] for i in plan)) + " баллов."
+    )
+    reply(peer_id, "\n".join(lines_q), yes_no_keyboard("points"))
+def award_report_points(peer_id, st):
+    """Выдаёт баллы по плану проверки. Возвращает (текст, клавиатура)."""
+    n = st.get("n", 2)
+    date_str = st.get("date", "")
+    plan = st.get("plan") or []
+    awarded = []
+    missed = []
+    with lock:
+        for item in plan:
+            nick = str(item.get("nick") or "")
+            delta = int(item.get("delta", 0) or 0)
+            norm = int(item.get("norm", 0) or 0)
+            player = find_by_nick(n, nick) if nick else None
+            if player is None or delta <= 0:
+                if nick:
+                    missed.append(nick)
+                continue
+            player["points"] += delta
+            contest_record(n, player, delta)
+            awarded.append({
+                "nick": player["nick"], "vk_id": player["vk_id"],
+                "pts": delta, "norm": norm, "total": player["points"],
+            })
+        if awarded:
+            # запоминаем суммарно выданную за эту дату норму, чтобы не выдать дважды
+            awarded_store = data.setdefault("points_awarded", {})
+            day = awarded_store.setdefault(date_str, {})
+            already = day.setdefault(str(n), {})
+            for a in awarded:
+                prev = already.get(a["nick"])
+                prev = int(prev) if isinstance(prev, int) else 0
+                already[a["nick"]] = max(prev, a["norm"])
+            save_data()
+    if not awarded:
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        text = "❌ Не удалось выдать баллы: никто из списка не найден."
+        if missed:
+            text += "\nНе найдены: " + ", ".join(missed)
+        return text, None
+    with lock:
+        REPORT_AWAIT[peer_id] = {
+            "stage": "ask_broadcast", "n": n, "date": date_str,
+            "awarded": awarded, "ts": time.time(),
+        }
+    lines = ["💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):"]
+    for a in awarded:
+        is_bonus = a["pts"] < a["norm"]
+        tag = " (доначислено)" if is_bonus else ""
+        lines.append("• " + a["nick"] + " +" + str(a["pts"]) + " (теперь " + str(a["total"]) + ")" + tag)
+    if missed:
+        lines.append("⚠️ Не найден: " + ", ".join(missed))
+    lines.append("")
+    lines.append("📣 Делаем рассылку о выдаче баллов?")
+    return "\n".join(lines), yes_no_keyboard("broadcast")
+def broadcast_report_points(peer_id, st):
+    """Пишет каждому награждённому игроку в ЛС о начисленных баллах."""
+    n = st.get("n", 2)
+    date_str = st.get("date", "")
+    awarded = st.get("awarded") or []
+    with lock:
+        REPORT_AWAIT.pop(peer_id, None)
+    sent = 0
+    failed = []
+    for a in awarded:
+        verb = "доначислено" if a["pts"] < a.get("norm", a["pts"]) else "начислено"
+        text = (
+            "✅ Вам " + verb + " " + str(a["pts"]) + " баллов за отчёт за " + date_str
+            + " (" + LIST_TITLE[n] + ").\nСейчас у вас " + str(a["total"]) + " баллов."
+        )
+        try:
+            vk.messages.send(user_id=a["vk_id"], message=text, random_id=get_random_id())
+            sent += 1
+        except Exception as e:
+            print("Не удалось написать " + str(a["vk_id"]) + ":", repr(e))
+            failed.append(a["nick"])
+        time.sleep(0.1)
+    lines = [
+        "📣 Рассылка выполнена: " + str(sent) + " из " + str(len(awarded))
+        + " игрокам отправлено сообщение о начислении баллов."
+    ]
+    if failed:
+        lines.append("⚠️ Не дошло: " + ", ".join(failed))
+    return "\n".join(lines), None
+def report_answer_response(user_id, peer_id, payload):
+    """Нажатие «Да/Нет» под вопросом бота по отчётам. Возвращает (текст, клавиатура)."""
+    if user_id not in ALLOWED_IDS and user_id not in NADMIN_IDS:
+        return None
+    action = str(payload.get("a") or "")
+    value = str(payload.get("v") or "")
+    st = _report_state(peer_id)
+    if st is None:
+        return "Этот вопрос уже не актуален — запустите проверку заново (/от или /отчеты).", None
+    stage = st.get("stage")
+    if (action == "points" and stage != "ask_points") or (action == "broadcast" and stage != "ask_broadcast"):
+        return "На этот вопрос уже ответили. Новых вопросов нет.", None
+    if value == "no":
+        with lock:
+            REPORT_AWAIT.pop(peer_id, None)
+        if action == "broadcast":
+            return "❌ Ок, рассылку не делаю.", None
+        return "❌ Ок, баллы не выдаю.", None
+    if action == "points":
+        return award_report_points(peer_id, st)
+    if action == "broadcast":
+        return broadcast_report_points(peer_id, st)
+    return "Неизвестное действие.", None
 # ==========================================================
 # /скрины Nick_Name | @username — все скрины игрока за сегодня
 #   1. админ пишет в чате /скрины Nick
@@ -2491,24 +2753,36 @@ def page_run_check(api, job):
     # смотрим обсуждение за этот день (по МСК)
     shots = {}
     need_check = any(e[2].lower() == "работает" for e in entries)
+    marker_ts = 0
+    has_new_after_marker = False
     if need_check:
         start = datetime(target.year, target.month, target.day, tzinfo=MSK)
         ts_from = int(start.timestamp())
         ts_to = int((start + timedelta(days=1)).timestamp())
         comments = fetch_topic_comments(api, group_id, topic_id, ts_from, ts_to)
+        # последняя метка «все выше отчеты проверены»: учитываем только то, что написано ПОСЛЕ неё
         for c in comments:
+            if (c.get("text") or "").strip().lower() == MARKER_TEXT:
+                marker_ts = max(marker_ts, int(c.get("date", 0) or 0))
+        for c in comments:
+            d = int(c.get("date", 0) or 0)
+            if marker_ts and d <= marker_ts:
+                continue
+            has_new_after_marker = True
             author = c.get("from_id", 0)
             shots[author] = shots.get(author, 0) + _count_images(c)
 
-    # пишем в обсуждении, что проверка закончена
-    try:
-        api.board.createComment(
-            group_id=group_id, topic_id=topic_id,
-            message="все выше отчеты проверены",
-            guid=str(get_random_id()),
-        )
-    except Exception as e:
-        print("Страничный бот: не удалось написать в обсуждение:", repr(e))
+    # пишем в обсуждении, что проверка закончена.
+    # Если после прошлой метки никто ничего не написал — метку повторно не ставим.
+    if not marker_ts or has_new_after_marker:
+        try:
+            api.board.createComment(
+                group_id=group_id, topic_id=topic_id,
+                message=MARKER_TEXT,
+                guid=str(get_random_id()),
+            )
+        except Exception as e:
+            print("Страничный бот: не удалось написать в обсуждение:", repr(e))
 
     # итог для основного бота
     lines = []
@@ -2517,6 +2791,10 @@ def page_run_check(api, job):
             k = shots.get(vid, 0)
             if k > 0:
                 lines.append(nick + " есть отчет " + str(k) + " " + plural_screens(k))
+            elif marker_ts:
+                # повторная проверка за день: после метки от этого игрока ничего нет —
+                # основной бот подставит результат прошлой проверки
+                lines.append(nick + " без изменений")
             else:
                 lines.append(nick + " нет отчета")
         else:
@@ -3049,7 +3327,9 @@ ADMIN_HELP = (
     "/отобс отчеты 2 — обсуждение для /отчеты\n"
     "/отчеты дд.мм.гггг — проверка отчётов для /список (общие админы)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня из обсуждений\n"
-    "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n\n"
+    "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
+    "💡 После проверки бот предложит выдать баллы (12+ скринов = 10 баллов, меньше = 7) и сделать рассылку игрокам. "
+    "\nПри повторной проверке баллы повторно не выдаются — доначисляется только разница.\n\n"
     "Отгул и отпуск теперь выдаёт только админ — в магазине эти товары убраны. "
     "Время считается по МСК."
 )
@@ -3080,6 +3360,7 @@ NADMIN_HELP = (
     "/от дд.мм.гггг — проверка отчётов для /нлист (админы /вдв и общие)\n"
     "/скрины Nick_Name или @username — скрины игрока за сегодня\n"
     "/отместо — показать где проверяются отчёты\n"
+    "💡 После проверки бот спросит про выдачу баллов (12+ скринов = 10, меньше = 7) и рассылку. Доначисляется только разница.\n"
 )
 def cmd_help(user_id):
     if user_id in ALLOWED_IDS:
@@ -3645,6 +3926,18 @@ def process_event(event):
 
     # Запоминаем всех, кто пишет боту в ЛС (для /рассылка)
     is_new = register_contact(from_id) if is_dm else False
+
+    # === Кнопки «Да/Нет» по отчётам (работают и в чатах, и в ЛС) ===
+    if payload and payload.get("c") == "rep_answer":
+        try:
+            result = report_answer_response(from_id, peer_id, payload)
+        except Exception as e:
+            print("Ошибка кнопки по отчётам:", repr(e))
+            result = "Произошла ошибка. Попробуйте позже.", None
+        if result is not None:
+            answer, kb = result
+            reply(peer_id, answer, kb)
+        return
 
     # === Нажатия на кнопки (только ЛС) ===
     if is_dm and payload:
