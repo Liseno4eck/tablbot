@@ -121,7 +121,11 @@ DEBUG = False
 # ==========================================================
 # ПОДКЛЮЧЕНИЕ К VK
 # ==========================================================
-vk_session = vk_api.VkApi(token=VK_TOKEN)
+# Inline-кнопки (внутри сообщения) поддерживаются VK начиная с API 5.104.
+# По умолчанию vk_api шлёт 5.92 и VK игнорирует "inline": true, поэтому
+# явно поднимаем версию.
+VK_API_VERSION = "5.199"
+vk_session = vk_api.VkApi(token=VK_TOKEN, api_version=VK_API_VERSION)
 vk = vk_session.get_api()
 executor = ThreadPoolExecutor(max_workers=8)
 # ==========================================================
