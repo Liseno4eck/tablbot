@@ -2137,13 +2137,15 @@ def _report_shots_count(status):
     m = re.search(r"есть\s+отч[её]т\s+(\d+)", (status or "").lower())
     return int(m.group(1)) if m else None
 def _shot_status_display(status):
-    """Как показывать статус игрока. Меньше REPORT_MIN_SHOTS скринов -> отчёт НЕ засчитан."""
+    """Как показывать статус игрока. <REPORT_MIN_SHOTS -> не засчитан. 4-5 -> на проверке."""
     k = _report_shots_count(status)
     if k is not None and k < REPORT_MIN_SHOTS:
         return (
             "не засчитан (мало скринов: " + str(k) + " " + plural_screens(k)
             + ", нужно от " + str(REPORT_MIN_SHOTS) + ")"
         )
+    if k is not None and k in REPORT_CHECK_SHOTS:
+        return status + " 🔎 на проверке"
     return status
 def _points_for_shots(k):
     """Норма: < REPORT_MIN_SHOTS скринов -> 0; >= REPORT_FULL_SHOTS -> полный балл, иначе частичный. Без отчёта -> 0."""
