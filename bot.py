@@ -2356,7 +2356,7 @@ def _advance_review(peer_id, st):
     st["msg_id"] = None
     if st.get("review"):
         q, kb = _ask_show_question(st)
-    elif st.get("awarded"):
+    elif st.get("awarded") or st.get("rejected"):
         q, kb = _broadcast_question(st)
     else:
         with lock:
@@ -2369,15 +2369,20 @@ def _advance_review(peer_id, st):
 def _broadcast_question(st):
     """Вопрос про рассылку (после всех выдач)."""
     awarded = st.get("awarded") or []
+    rejected = st.get("rejected") or []
     date_str = st.get("date", "")
     n = st.get("n", 2)
-    lines = ["💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):"]
-    for a in awarded:
-        is_bonus = a["pts"] < a["norm"]
-        tag = " (доначислено)" if is_bonus else ""
-        lines.append("• " + a["nick"] + " +" + str(a["pts"]) + " (теперь " + str(a["total"]) + ")" + tag)
+    lines = []
+    if awarded:
+        lines.append("💰 Выдал баллы за отчёты за " + date_str + " (" + LIST_TITLE[n] + "):")
+        for a in awarded:
+            is_bonus = a["pts"] < a["norm"]
+            tag = " (доначислено)" if is_bonus else ""
+            lines.append("• " + a["nick"] + " +" + str(a["pts"]) + " (теперь " + str(a["total"]) + ")" + tag)
+    if rejected:
+        lines.append("❌ Не выдано баллов (отклонено): " + ", ".join(rejected))
     lines.append("")
-    lines.append("📣 Делаем рассылку о выдаче баллов?")
+    lines.append("📣 Делаем рассылку (всем: кому выдали и кому не выдали баллы)?")
     q_text = "\n".join(lines)
     st["stage"] = "ask_broadcast"
     st["question"] = q_text
@@ -2440,6 +2445,7 @@ def _review_give(peer_id, st, approve):
     """Итог вопроса «выдать баллы проверяемому игроку?» и переход к следующему шагу."""
     item = st["review"].pop(0)
     if not approve:
+        st["rejected"] = (st.get("rejected") or []) + [item["nick"]]
         note = "❌ Ок, " + item["nick"] + " баллы не выдаю."
     else:
         awarded, missed = _grant_one(st.get("n", 2), st.get("date", ""), item)
@@ -2488,10 +2494,12 @@ def award_report_points(peer_id, st):
         return text, None
     return _broadcast_question(st)
 def broadcast_report_points(peer_id, st):
-    """Пишет каждому награждённому игроку в ЛС о начисленных баллах."""
+    """Пишет каждому награждённому игроку в ЛС о начисленных баллах,
+    а также тем кому баллы НЕ выданы — с указанием причины."""
     n = st.get("n", 2)
     date_str = st.get("date", "")
     awarded = st.get("awarded") or []
+    rejected = st.get("rejected") or []
     with lock:
         REPORT_AWAIT.pop(peer_id, None)
     sent = 0
@@ -2515,6 +2523,106 @@ def broadcast_report_points(peer_id, st):
     ]
     if failed:
         lines.append("⚠️ Не дошло: " + ", ".join(failed))
+
+    # Определяем, кому баллы НЕ выданы, и рассылаем причины
+    with lock:
+        all_reports = ((data.get("reports") or {}).get(date_str) or {}).get(str(n)) or {}
+    awarded_nicks = set(a["nick"] for a in awarded)
+    rejected_set = set(rejected)
+
+    # Категории невыдачи
+    no_report = []          # "вы не залили отчет"
+    vacation_otgul = []     # "у вас отгул/отпуск"
+    not_enough = []         # "Ваших скринов в отчете не достаточно для оценки и выдачи баллов"
+
+    for nick, status in all_reports.items():
+        if nick in awarded_nicks:
+            continue
+        status_lower = (status or "").lower()
+        k = _report_shots_count(status)
+        if nick in rejected_set:
+            # Отклонён админом при проверке 4-5 скринов
+            not_enough.append(nick)
+        elif "нет отч" in status_lower:
+            no_report.append(nick)
+        elif "отгул" in status_lower or "отпуск" in status_lower:
+            vacation_otgul.append(nick)
+        elif k is not None and k < REPORT_MIN_SHOTS:
+            not_enough.append(nick)
+        else:
+            # Остальные случаи (например, "без изменений" без пред. статуса) — тоже нет отчёта
+            no_report.append(nick)
+
+    # Рассылаем каждому свою причину
+    total_nr_sent = 0
+    total_vo_sent = 0
+    total_ne_sent = 0
+    nr_failed = []
+    vo_failed = []
+    ne_failed = []
+
+    for nick in no_report:
+        player = find_by_nick(n, nick)
+        if player is None:
+            continue
+        text = (
+            "❌ Вам не начислены баллы за отчёт за " + date_str + " (" + LIST_TITLE[n] + ").\n"
+            "Причина: вы не залили отчет."
+        )
+        try:
+            vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
+            total_nr_sent += 1
+        except Exception as e:
+            print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
+            nr_failed.append(nick)
+        time.sleep(0.1)
+
+    for nick in vacation_otgul:
+        player = find_by_nick(n, nick)
+        if player is None:
+            continue
+        text = (
+            "ℹ️ Вам не начислены баллы за отчёт за " + date_str + " (" + LIST_TITLE[n] + ").\n"
+            "Причина: у вас отгул/отпуск."
+        )
+        try:
+            vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
+            total_vo_sent += 1
+        except Exception as e:
+            print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
+            vo_failed.append(nick)
+        time.sleep(0.1)
+
+    for nick in not_enough:
+        player = find_by_nick(n, nick)
+        if player is None:
+            continue
+        text = (
+            "⚠️ Вам не начислены баллы за отчёт за " + date_str + " (" + LIST_TITLE[n] + ").\n"
+            "Причина: Ваших скринов в отчете не достаточно для оценки и выдачи баллов."
+        )
+        try:
+            vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
+            total_ne_sent += 1
+        except Exception as e:
+            print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
+            ne_failed.append(nick)
+        time.sleep(0.1)
+
+    total_not_awarded = len(no_report) + len(vacation_otgul) + len(not_enough)
+    if total_not_awarded > 0:
+        lines.append("")
+        lines.append("📩 Сообщения о невыдаче баллов:")
+        if no_report:
+            lines.append("  • Не залили отчёт (" + str(total_nr_sent) + "/" + str(len(no_report)) + "): " + ", ".join(no_report))
+        if vacation_otgul:
+            lines.append("  • Отгул/отпуск (" + str(total_vo_sent) + "/" + str(len(vacation_otgul)) + "): " + ", ".join(vacation_otgul))
+        if not_enough:
+            lines.append("  • Мало скринов (" + str(total_ne_sent) + "/" + str(len(not_enough)) + "): " + ", ".join(not_enough))
+        all_nr_failed = nr_failed + vo_failed + ne_failed
+        if all_nr_failed:
+            lines.append("⚠️ Не дошло (невыдача): " + ", ".join(all_nr_failed))
+
     return "\n".join(lines), None
 def report_answer_response(user_id, peer_id, payload):
     """Нажатие «Да/Нет» под вопросом бота по отчётам. Возвращает (текст, клавиатура) или None."""
@@ -2535,6 +2643,7 @@ def report_answer_response(user_id, peer_id, payload):
             close_question(peer_id, st, "✅ Ответ: Да — показываю скрины.")
             return _request_review_shots(peer_id, st)
         item = st["review"].pop(0)
+        st["rejected"] = (st.get("rejected") or []) + [item["nick"]]
         close_question(peer_id, st, "❌ Ответ: Нет — скрины не показываю, баллы не выдаю.")
         if st.get("review") or st.get("awarded"):
             q, kb = _advance_review(peer_id, st)
