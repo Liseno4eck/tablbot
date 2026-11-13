@@ -3442,8 +3442,26 @@ def do_buy(user_id, n, idx, price, crc):
         player["points"] -= item_price
         left = player["points"]
 
-        # отгул и отпуск теперь выдаёт только админ — в магазине всегда kind="other"
+        # определяем kind по названию товара
         kind = "other"
+        if is_vacation_item(item_name):
+            kind = "vacation"
+            player["vac_stage"] = "days"
+            player["vac_max"] = 4
+            player["vac_pending"] = {
+                "item": item_name,
+                "price": item_price,
+                "num": num,
+                "pid": purchase_id,
+            }
+            answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + ".\n\nТеперь напишите, на сколько дней отпуск? (максимум 4 дня, просто число, например 3)"
+        elif item_name.lower().strip() == "отгул":
+            kind = "otgul"
+            player["otgul_end"] = today_local().isoformat()
+            answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + ".\n✅ Отгул выдан на сегодня."
+        else:
+            answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + "."
+
         history = player.setdefault("purchases", [])
         history.append({
             "id": purchase_id,
@@ -3455,13 +3473,16 @@ def do_buy(user_id, n, idx, price, crc):
         })
         player["purchases"] = history[-PURCHASE_HISTORY_LIMIT:]
 
-        answer = "✅ Вы купили: " + item_name + " (покупка №" + str(purchase_id) + "). Осталось баллов: " + str(left) + "."
-
         save_data()
-        text = (
-            "Покупка №" + str(purchase_id) + ": [id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
-            + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
-        )
+        if kind == "otgul":
+            text = (
+                "Покупка №" + str(purchase_id) + ": [id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил отгул (№" + str(num) + ": " + item_name + ", " + str(item_price) + " баллов). Отгул выдан на сегодня."
+            )
+        else:
+            text = (
+                "Покупка №" + str(purchase_id) + ": [id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил №" + str(num) + ": "
+                + item_name + " (" + str(item_price) + " баллов). Выдайте ему."
+            )
         notify_for_list(n, text)
         return answer
 # ==========================================================
@@ -3541,7 +3562,7 @@ def button_response(user_id, payload):
 
     return MENU_TEXT, menu_keyboard()
 # ==========================================================
-# ОТПУСК: диалог после покупки (дата -> включительно да/нет)
+# ОТПУСК: диалог после покупки (кол-во дней -> включительно да/нет)
 # ==========================================================
 YES_WORDS = {"да", "д", "yes", "y", "+", "дa"}
 NO_WORDS = {"нет", "н", "no", "n", "-", "нeт"}
@@ -3551,6 +3572,20 @@ def handle_vacation_reply(player, user_id, n, text):
     pending = player.get("vac_pending") or {}
     max_days = player.get("vac_max", DEFAULT_VACATION_MAX_DAYS)
     answer = text.strip().lower()
+
+    if stage == "days":
+        try:
+            days = int(text.strip())
+        except ValueError:
+            return "Напишите число от 1 до " + str(max_days) + " (на сколько дней отпуск):"
+        if days < 1 or days > max_days:
+            return "Не больше " + str(max_days) + " дней. Напишите число от 1 до " + str(max_days) + ":"
+        end = today_local() + timedelta(days=days)
+        pending["end"] = end.isoformat()
+        player["vac_pending"] = pending
+        player["vac_stage"] = "incl"
+        save_data()
+        return "Отпуск до " + format_date(end) + " включительно? Ответьте: да / нет"
 
     if stage == "date":
         end = parse_vacation_date(text)
@@ -3614,8 +3649,6 @@ def cmd_shop_add(args, n):
         return "Формат: /+магазин 100 что выдать"
     price = int(args[0])
     name = " ".join(args[1:])
-    if is_vacation_item(name) or name.lower().strip() == "отгул":
-        return "Товары «отпуск» и «отгул» больше не продаются — их выдаёт только админ."
     with lock:
         S(n).append({"name": name, "price": price})
         num = len(S(n))
@@ -3702,7 +3735,7 @@ ADMIN_HELP = (
     "Меньше 4 скринов — отчёт не засчитывается (0 баллов).\n"
     "При повторной проверке баллы повторно не выдаются — доначисляется только разница.\n"
     "Кому баллы уже выдавались за эту дату — тому не придёт «вам не начислены баллы».\n\n"
-    "Отгул и отпуск теперь выдаёт только админ — в магазине эти товары убраны. "
+    "Отгул и отпуск можно купить в магазине (цена 0 баллов) или выдать командой. "
     "Время считается по МСК."
 )
 NADMIN_HELP = (
@@ -4466,6 +4499,46 @@ def safe_process(event):
     except Exception as e:
         print("Ошибка обработки:", repr(e))
 # ==========================================================
+# НОЧНАЯ ОЧИСТКА: сброс просроченных отгулов/отпусков в 00:00 МСК
+# ==========================================================
+def midnight_cleanup_loop():
+    """Фоновый поток: каждый день в 00:00 МСК проверяет и снимает
+    просроченные статусы отгула и отпуска, уведомляет админов."""
+    while True:
+        now = datetime.now(MSK)
+        # вычисляем ближайшую полночь МСК
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+        sleep_seconds = (midnight - now).total_seconds()
+        time.sleep(sleep_seconds)
+        # наступила полночь — чистим
+        print("Полночь МСК: ночная очистка статусов отгула/отпуска...")
+        cleaned_otgul = []
+        cleaned_vacation = []
+        with lock:
+            changed = False
+            for n in (1, 2):
+                for p in P(n).values():
+                    was_otgul = bool(p.get("otgul_end"))
+                    _, ch_otgul = otgul_active(p)
+                    if was_otgul and not ch_otgul:
+                        cleaned_otgul.append(p["nick"])
+                        changed = True
+                    was_vac = bool(p.get("vacation"))
+                    _, ch_vac = vacation_active(p)
+                    if was_vac and not ch_vac:
+                        cleaned_vacation.append(p["nick"])
+                        changed = True
+            if changed:
+                save_data()
+        if cleaned_otgul:
+            msg = "🌙 Ночная очистка: снят отгул — " + ", ".join(cleaned_otgul)
+            print(msg)
+            notify_admins(msg)
+        if cleaned_vacation:
+            msg = "🌙 Ночная очистка: снят отпуск — " + ", ".join(cleaned_vacation)
+            print(msg)
+            notify_admins(msg)
+# ==========================================================
 # ЗАПУСК БОТА
 # ==========================================================
 def main():
@@ -4511,6 +4584,8 @@ def main():
     # заранее рисуем и загружаем картинки-справки, чтобы /help отвечал сразу
     executor.submit(get_help_photo, "admin")
     executor.submit(get_help_photo, "nadmin")
+    # запускаем ночную очистку статусов отгула/отпуска (00:00 МСК)
+    threading.Thread(target=midnight_cleanup_loop, daemon=True).start()
     while True:
         try:
             longpoll = VkBotLongPoll(vk_session, GROUP_ID)
