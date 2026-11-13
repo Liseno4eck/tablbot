@@ -161,6 +161,8 @@ data = {
     "reports": {},
     # кому уже выдали баллы за отчёт: "дд.мм.гггг" -> {list_type: {nick: сколько выдано}}
     "points_awarded": {},
+    # кому уже отправляли уведомления о результатах проверки: "дд.мм.гггг" -> {list_type: {nick: "awarded"|"missed"}}
+    "notified": {},
     # ники для отчётов (складываются в Gist)
     "report_nicks": {},
     # конкурс: период и заработанные баллы
@@ -566,6 +568,32 @@ def _norm_points_awarded(raw):
         if entry:
             result[day] = entry
     return result
+def _norm_notified(raw):
+    """"дд.мм.гггг" -> {"1": {nick: "awarded"|"missed"}, "2": {...}}.
+    Какое уведомление по отчётам уже отправляли игроку за эту дату:
+    "awarded" — о начислении баллов, "missed" — что баллы не начислены."""
+    result = {}
+    if not isinstance(raw, dict):
+        return result
+    for day, lists in raw.items():
+        day = str(day).strip()
+        if not re.fullmatch(r"\d{2}\.\d{2}\.\d{4}", day) or not isinstance(lists, dict):
+            continue
+        entry = {}
+        for key in ("1", "2"):
+            block = lists.get(key)
+            if not isinstance(block, dict):
+                continue
+            nick_map = {}
+            for nick, kind in block.items():
+                nick = str(nick).strip()
+                if nick and kind in ("awarded", "missed"):
+                    nick_map[nick] = kind
+            if nick_map:
+                entry[key] = nick_map
+        if entry:
+            result[day] = entry
+    return result
 def _norm_report_settings(raw):
     """Настройки «где проверять отчёты»: group_id, topic_ot, topic_otchety."""
     raw = raw if isinstance(raw, dict) else {}
@@ -665,6 +693,7 @@ def _normalize_loaded(loaded):
         "contest": _norm_contest(loaded.get("contest")),
         "last_admin_msg": _norm_last_admin_msg(loaded.get("last_admin_msg")),
         "points_awarded": _norm_points_awarded(loaded.get("points_awarded")),
+        "notified": _norm_notified(loaded.get("notified")),
     }
 def load_data():
     local = _read_local()
@@ -707,6 +736,7 @@ def load_data():
     data["contest"] = normalized["contest"]
     data["last_admin_msg"] = normalized["last_admin_msg"]
     data["points_awarded"] = normalized["points_awarded"]
+    data["notified"] = normalized["notified"]
     ALLOWED_IDS.clear()
     ALLOWED_IDS.update(BASE_ADMIN_IDS)
     ALLOWED_IDS.update(data["admins"])
@@ -2495,15 +2525,24 @@ def award_report_points(peer_id, st):
     return _broadcast_question(st)
 def broadcast_report_points(peer_id, st):
     """Пишет каждому награждённому игроку в ЛС о начисленных баллах,
-    а также тем кому баллы НЕ выданы — с указанием причины."""
+    а также тем кому баллы НЕ выданы — с указанием причины.
+    Уже отправленные за эту дату уведомления не дублируются:
+    сообщение о невыдаче приходит игроку только один раз. Повторно
+    пишет только в одном случае — раньше баллов/сообщения не было,
+    а теперь игрок залил отчёт и баллы начислены (или доначислены)."""
     n = st.get("n", 2)
     date_str = st.get("date", "")
     awarded = st.get("awarded") or []
     rejected = st.get("rejected") or []
     with lock:
         REPORT_AWAIT.pop(peer_id, None)
+        notified = dict(((data.get("notified") or {}).get(date_str) or {}).get(str(n)) or {})
+        already_map = ((data.get("points_awarded") or {}).get(date_str) or {}).get(str(n)) or {}
+    awarded_nicks = set(a["nick"] for a in awarded)
     sent = 0
     failed = []
+    # Каждое сообщение в этом списке — реальная новая выдача (delta > 0),
+    # повторно за ту же дату баллы не выдаются, так что дубля тут быть не может.
     for a in awarded:
         verb = "доначислено" if a["pts"] < a.get("norm", a["pts"]) else "начислено"
         text = (
@@ -2513,6 +2552,7 @@ def broadcast_report_points(peer_id, st):
         try:
             vk.messages.send(user_id=a["vk_id"], message=text, random_id=get_random_id())
             sent += 1
+            notified[a["nick"]] = "awarded"
         except Exception as e:
             print("Не удалось написать " + str(a["vk_id"]) + ":", repr(e))
             failed.append(a["nick"])
@@ -2527,16 +2567,25 @@ def broadcast_report_points(peer_id, st):
     # Определяем, кому баллы НЕ выданы, и рассылаем причины
     with lock:
         all_reports = ((data.get("reports") or {}).get(date_str) or {}).get(str(n)) or {}
-    awarded_nicks = set(a["nick"] for a in awarded)
     rejected_set = set(rejected)
 
     # Категории невыдачи
     no_report = []          # "вы не залили отчет"
     vacation_otgul = []     # "у вас отгул/отпуск"
     not_enough = []         # "Ваших скринов в отчете не достаточно для оценки и выдачи баллов"
+    prev_awarded = []       # баллы уже были выданы в прошлую проверку — писать нечего
+    dup_notified = []       # сообщение за эту дату уже отправляли — не дублируем
 
     for nick, status in all_reports.items():
         if nick in awarded_nicks:
+            continue
+        # Баллы уже были выданы в прошлую проверку — никаких «вам не начислены»
+        if nick in already_map:
+            prev_awarded.append(nick)
+            continue
+        # За эту дату игроку уже писали — повторно не отправляем
+        if nick in notified:
+            dup_notified.append(nick)
             continue
         status_lower = (status or "").lower()
         k = _report_shots_count(status)
@@ -2572,6 +2621,7 @@ def broadcast_report_points(peer_id, st):
         try:
             vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
             total_nr_sent += 1
+            notified[nick] = "missed"
         except Exception as e:
             print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
             nr_failed.append(nick)
@@ -2588,6 +2638,7 @@ def broadcast_report_points(peer_id, st):
         try:
             vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
             total_vo_sent += 1
+            notified[nick] = "missed"
         except Exception as e:
             print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
             vo_failed.append(nick)
@@ -2604,6 +2655,7 @@ def broadcast_report_points(peer_id, st):
         try:
             vk.messages.send(user_id=player["vk_id"], message=text, random_id=get_random_id())
             total_ne_sent += 1
+            notified[nick] = "missed"
         except Exception as e:
             print("Не удалось написать " + str(player["vk_id"]) + ":", repr(e))
             ne_failed.append(nick)
@@ -2622,6 +2674,17 @@ def broadcast_report_points(peer_id, st):
         all_nr_failed = nr_failed + vo_failed + ne_failed
         if all_nr_failed:
             lines.append("⚠️ Не дошло (невыдача): " + ", ".join(all_nr_failed))
+    if prev_awarded:
+        lines.append("✅ Баллы были выданы ранее — не уведомляю: " + ", ".join(prev_awarded))
+    if dup_notified:
+        lines.append("🔁 Уже получали сообщение за эту дату — не дублирую: " + ", ".join(dup_notified))
+
+    # Запоминаем, кому уже писали за эту дату (записываем только реально
+    # отправленные сообщения — недошедшие придут в следующий раз)
+    with lock:
+        day = data.setdefault("notified", {}).setdefault(date_str, {})
+        day[str(n)] = notified
+        save_data()
 
     return "\n".join(lines), None
 def report_answer_response(user_id, peer_id, payload):
@@ -3688,7 +3751,9 @@ ADMIN_HELP = (
     "💡 После проверки бот предложит выдать баллы (10+ скринов = 10 баллов, 6-9 = 7).\n"
     "4-5 скринов: бот покажет их и спросит, выдавать ли 7 баллов.\n"
     "Меньше 4 скринов — отчёт не засчитывается (0 баллов).\n"
-    "При повторной проверке баллы повторно не выдаются — доначисляется только разница.\n\n"
+    "При повторной проверке баллы повторно не выдаются — доначисляется только разница.\n"
+    "Уведомления в ЛС не дублируются: за одну дату игроку приходит одно сообщение.\n"
+    "Исключение — раньше отчёта не было, а игрок его залил: тогда придёт «начислено/доначислено».\n\n"
     "Отгул и отпуск теперь выдаёт только админ — в магазине эти товары убраны. "
     "Время считается по МСК."
 )
