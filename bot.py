@@ -3223,8 +3223,8 @@ def cmd_report_settings(raw_cmd, args, user_id):
         if len(args) != 1 or not re.fullmatch(r"-?\d+", args[0]):
             return "Формат: /отгруппа 123456"
         gid = abs(int(args[0]))
-        if gid <= 0:
-            return "ID сообщества должен быть больше 0."
+        if gid <= -1:
+            return "ID сообщества должен быть больше -1."
         with lock:
             data["report_settings"] = {**st, "group_id": gid}
             save_data()
