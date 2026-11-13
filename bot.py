@@ -3613,8 +3613,6 @@ def cmd_shop_add(args, n):
     if len(args) < 2 or not re.fullmatch(r"\d+", args[0]):
         return "Формат: /+магазин 100 что выдать"
     price = int(args[0])
-    if price <= 0:
-        return "Цена должна быть больше 0."
     name = " ".join(args[1:])
     if is_vacation_item(name) or name.lower().strip() == "отгул":
         return "Товары «отпуск» и «отгул» больше не продаются — их выдаёт только админ."
