@@ -3472,6 +3472,11 @@ def do_buy(user_id, n, idx, price, crc):
         player["purchases"] = history[-PURCHASE_HISTORY_LIMIT:]
 
         save_data()
+        # Для отпуска уведомление админам отправляем НЕ здесь, а после того,
+        # как игрок укажет дни и подтвердит «включительно/не включительно»
+        # (см. handle_vacation_reply, stage == "incl").
+        if kind == "vacation":
+            return answer
         if kind == "otgul":
             text = (
                 "Покупка №" + str(purchase_id) + ": [id" + str(user_id) + "|@" + nick + "] (" + nick + ") купил отгул (№" + str(num) + ": " + item_name + ", " + str(item_price) + " баллов). Отгул выдан на сегодня."
