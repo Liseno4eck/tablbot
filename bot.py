@@ -467,7 +467,7 @@ def _norm_players(raw_players):
             }
     return players
 def _norm_shop(raw_shop):
-    """Магазин. Товары «отгул» и «отпуск» больше не продаются — убираются из списка."""
+    """Магазин. Товары «отгул» и «отпуск» теперь можно добавлять."""
     shop = []
     if isinstance(raw_shop, list):
         for item in raw_shop:
@@ -478,9 +478,7 @@ def _norm_shop(raw_shop):
                 price = int(item.get("price", 0))
             except (TypeError, ValueError):
                 continue
-            if not name or price <= 0:
-                continue
-            if is_vacation_item(name) or name.lower() == "отгул":
+            if not name:
                 continue
             shop.append({"name": name, "price": price})
     return shop
