@@ -1432,6 +1432,13 @@ def cmd_rollback(args, admin_id, is_common):
                 player["vac_pending"] = None
         elif kind == "otgul":
             player["otgul"] = max(0, int(player.get("otgul", 0) or 0) - 1)
+            # снимаем статус отгула, только если это самая свежая покупка отгула
+            later = any(
+                x.get("kind") == "otgul" and x.get("id", 0) > pid
+                for x in purchases
+            )
+            if not later:
+                player["otgul_end"] = None
         price = int(last.get("price", 0))
         if refund:
             player["points"] += price
