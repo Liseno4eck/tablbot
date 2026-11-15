@@ -1469,6 +1469,23 @@ def render_contest_podium(start, end, ranked):
     buf.seek(0)
     buf.name = "contest.png"
     return buf
+def _contest_photo(start, end, ranked):
+    """Рисует и загружает пьедестал в VK с повторами. Возвращает attachment-строку или None."""
+    for attempt in range(3):
+        try:
+            buf = render_contest_podium(start, end, ranked)
+            if buf is None:
+                raise RuntimeError("Pillow/шрифт недоступны")
+            upload = vk_api.VkUpload(vk_session)
+            ph = upload.photo_messages(photos=buf)[0]
+            att = "photo" + str(ph["owner_id"]) + "_" + str(ph["id"])
+            if ph.get("access_key"):
+                att += "_" + str(ph["access_key"])
+            return att
+        except Exception as e:
+            print("Конкурс: попытка " + str(attempt + 1) + "/3 не удалась:", repr(e))
+            time.sleep(1.5)
+    return None
 def handle_contest_button(user_id, peer_id):
     """Кнопка «Конкурс» / команда /конкурс от игрока: рейтинг текстом + картинка-пьедестал."""
     start, end, items = contest_rating_rows()
@@ -1491,19 +1508,44 @@ def handle_contest_button(user_id, peer_id):
     for rank, nick, n, pts, vid in ranked:
         mark = medals.get(rank, str(rank) + ".")
         lines.append(mark + " " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
-    reply_long(peer_id, "\n".join(lines))
+    text = "\n".join(lines)
+
+    # рисуем и загружаем пьедестал (с повторами), чтобы отправить вместе с текстом
+    att = _contest_photo(start, end, ranked)
+    if att:
+        # общий лимит сообщения 4000 символов — если рейтинг не влезает вместе с фото,
+        # фото шлём к первой части, остальное дописываем следом
+        head = text[:3900]
+        rest = text[3900:]
+        try:
+            vk.messages.send(peer_id=peer_id, message=head, attachment=att,
+                             random_id=get_random_id())
+        except Exception as e:
+            print("Конкурс: сообщение с фото не отправилось, шлю отдельно:", repr(e))
+            reply(peer_id, text)
+            try:
+                vk.messages.send(peer_id=peer_id, message="🏆 Пьедестал конкурса 👆",
+                                 attachment=att, random_id=get_random_id())
+            except Exception as e2:
+                print("Конкурс: фото не отправилось:", repr(e2))
+        if rest:
+            for chunk in split_long_text(rest):
+                reply(peer_id, chunk)
+                time.sleep(0.2)
+    else:
+        # фото получить не удалось — всё равно шлём рейтинг и пробуем фон ещё раз
+        reply_long(peer_id, text)
+        executor.submit(_retry_contest_photo, peer_id, start, end, ranked)
+def _retry_contest_photo(peer_id, start, end, ranked):
+    """Фоновая дозагрузка: если пьедестал не отправился сразу, пробуем ещё раз и шлём отдельно."""
+    att = _contest_photo(start, end, ranked)
+    if not att:
+        return
     try:
-        buf = render_contest_podium(start, end, ranked)
-        if buf:
-            upload = vk_api.VkUpload(vk_session)
-            ph = upload.photo_messages(photos=buf)[0]
-            att = "photo" + str(ph["owner_id"]) + "_" + str(ph["id"])
-            if ph.get("access_key"):
-                att += "_" + str(ph["access_key"])
-            vk.messages.send(peer_id=peer_id, message="🏆 Пьедестал конкурса 👆",
-                             attachment=att, random_id=get_random_id())
+        vk.messages.send(peer_id=peer_id, message="🏆 Пьедестал конкурса 👆",
+                         attachment=att, random_id=get_random_id())
     except Exception as e:
-        print("Конкурс: не удалось отправить пьедестал:", repr(e))
+        print("Конкурс: фоновая отправка фото не удалась:", repr(e))
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
@@ -3551,6 +3593,7 @@ def menu_keyboard():
     kb.add_line()
     btn(kb, "🏆 Топ", "top")
     btn(kb, "🌐 Общий топ", "top_all")
+    btn(kb, "🏆 Конкурс", "contest", VkKeyboardColor.PRIMARY)
     kb.add_line()
     btn(kb, "❓ Помощь", "help")
     return kb.get_keyboard()
