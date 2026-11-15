@@ -1502,8 +1502,10 @@ def handle_contest_button(user_id, peer_id):
         "🏆 Конкурс " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (" + status + ")",
         "",
     ]
-    for rank, nick, n, pts, vid in ranked:
-        mark = medals.get(rank, str(rank) + ".")
+    # в общем списке — сквозная нумерация 1, 2, 3, 4... (без разделения мест);
+    # на фото-пьедестале при этом остаются места 1-2-3 с совместными призёрами
+    for i, (nick, n, pts, vid) in enumerate(items, 1):
+        mark = medals.get(i, str(i) + ".")
         lines.append(mark + " " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
     text = "\n".join(lines)
 
