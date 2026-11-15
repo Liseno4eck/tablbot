@@ -1224,6 +1224,8 @@ def cmd_contest(args):
     with lock:
         data["contest"] = {"start": start.isoformat(), "end": end.isoformat(), "earned": {}}
         save_data()
+    # рассылаем всем привязанным игрокам уведомление о старте конкурса
+    executor.submit(notify_contest_started)
     today = today_local()
     if today < start:
         note = "Подсчёт начнётся " + _fmt_full_date(start) + " (МСК)."
@@ -1271,6 +1273,237 @@ def cmd_contest_results():
     for i, (nick, n, pts) in enumerate(items, 1):
         lines.append(str(i) + ". " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
     return "\n".join(lines)
+# ==========================================================
+# КОНКУРС: рассылка о старте + кнопка «Конкурс» (рейтинг и пьедестал)
+# ==========================================================
+def contest_notify_keyboard():
+    """Инлайн-кнопка «🏆 Конкурс» в рассылке о старте конкурса."""
+    kb = VkKeyboard(inline=True)
+    kb.add_button("🏆 Конкурс", color=VkKeyboardColor.PRIMARY, payload={"c": "contest"})
+    return kb.get_keyboard()
+def notify_contest_started():
+    """Пишет каждому привязанному игроку о старте конкурса (с кнопкой рейтинга)."""
+    with lock:
+        start, end = contest_period()
+        if start is None:
+            return
+        ids = list(dict.fromkeys(p["vk_id"] for n in (1, 2) for p in P(n).values()))
+    text = (
+        "⚡ Внимание! Администратором запущен конкурс по баллам — "
+        "самые активные получат в конце бонус!\n"
+        "Период: " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (МСК).\n"
+        "Для просмотра текущего рейтинга жми на кнопку 👇"
+    )
+    kb = contest_notify_keyboard()
+    for uid in ids:
+        try:
+            vk.messages.send(user_id=uid, message=text, random_id=get_random_id(), keyboard=kb)
+        except Exception as e:
+            print("Конкурс: не удалось отправить " + str(uid) + ":", repr(e))
+        time.sleep(0.1)
+def cmd_contest_remind():
+    """/напомнить — рассылка всем привязанным игрокам напоминания о конкурсе."""
+    with lock:
+        ids = list(dict.fromkeys(p["vk_id"] for n in (1, 2) for p in P(n).values()))
+    if not ids:
+        return "Нет привязанных игроков."
+    text = (
+        "📢 Сейчас идёт активный конкурс недели!\n"
+        "Для проверки топа жми на кнопку 👇"
+    )
+    kb = contest_notify_keyboard()
+    sent = 0
+    failed = 0
+    for uid in ids:
+        try:
+            vk.messages.send(user_id=uid, message=text, random_id=get_random_id(), keyboard=kb)
+            sent += 1
+        except Exception as e:
+            failed += 1
+            print("Напоминание: не удалось отправить " + str(uid) + ":", repr(e))
+        time.sleep(0.1)
+    return "📣 Напоминание о конкурсе отправлено: " + str(sent) + ", не доставлено: " + str(failed) + "."
+def contest_rating_rows():
+    """Общий рейтинг конкурса: [(nick, n, pts, vk_id)], от большего к меньшему."""
+    with lock:
+        start, end = contest_period()
+        earned = dict((data.get("contest") or {}).get("earned", {}))
+        rows = {}
+        for key, e in earned.items():
+            vid = 0
+            try:
+                vid = int(str(key).split(":", 1)[1])
+            except (ValueError, IndexError):
+                pass
+            rows[key] = (e.get("nick", "?"), int(e.get("n", 1)), int(e.get("pts", 0)), vid)
+        for n in (1, 2):
+            for p in P(n).values():
+                key = str(n) + ":" + str(p["vk_id"])
+                if key not in rows:
+                    rows[key] = (p["nick"], n, 0, p["vk_id"])
+    items = sorted(rows.values(), key=lambda r: (-r[2], r[0].lower()))
+    return start, end, items
+def contest_ranked(items):
+    """Присваивает места: одинаковые баллы = одно место (1, 1, 3 -> группы 1, 2, 3 по очкам)."""
+    seen_pts = []
+    out = []
+    for nick, n, pts, vid in items:
+        if pts not in seen_pts:
+            seen_pts.append(pts)
+        out.append((seen_pts.index(pts) + 1, nick, n, pts, vid))
+    return out
+_AVATAR_CACHE = {}
+def _avatar_image(vk_id):
+    """Квадратный аватар пользователя (PIL Image) или None."""
+    img = _AVATAR_CACHE.get(vk_id)
+    if img is not None:
+        return img
+    url = None
+    try:
+        users = vk.users.get(user_ids=vk_id, fields="photo_200,photo_100")
+        if users:
+            url = users[0].get("photo_200") or users[0].get("photo_100")
+    except Exception as e:
+        print("Конкурс: не удалось получить аватар " + str(vk_id) + ":", repr(e))
+    if not url:
+        return None
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "vk-points-bot"})
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            raw = BytesIO(resp.read())
+        im = Image.open(raw).convert("RGB")
+        side = min(im.size)
+        left = (im.width - side) // 2
+        top = (im.height - side) // 2
+        im = im.crop((left, top, left + side, top + side))
+        _AVATAR_CACHE[vk_id] = im
+        return im
+    except Exception as e:
+        print("Конкурс: не удалось скачать аватар:", repr(e))
+        return None
+def _circle_avatar(im, d):
+    """Круглый аватар заданного диаметра (RGBA)."""
+    out = Image.new("RGBA", (d, d), (0, 0, 0, 0))
+    src = im.resize((d, d))
+    mask = Image.new("L", (d, d), 0)
+    ImageDraw.Draw(mask).ellipse((0, 0, d - 1, d - 1), fill=255)
+    out.paste(src, (0, 0), mask)
+    return out
+def render_contest_podium(start, end, ranked):
+    """Рисует пьедестал (2-1-3) с аватарами. Разделённые места ставят всех обладателей рядом.
+    ranked: [(rank, nick, n, pts, vid)] с присвоенными местами. Возвращает BytesIO (PNG) или None."""
+    if not PIL_OK:
+        return None
+    reg = _find_font(False)
+    bold = _find_font(True) or reg
+    if not reg:
+        return None
+    groups = {1: [], 2: [], 3: []}
+    for rank, nick, n, pts, vid in ranked:
+        if rank in groups:
+            groups[rank].append((nick, pts, vid))
+    W, H = 1280, 900
+    img = Image.new("RGB", (W, H))
+    d = ImageDraw.Draw(img)
+    for y in range(H):
+        t = y / max(1, H - 1)
+        d.line([(0, y), (W, y)], fill=(int(16 + 24 * t), int(18 + 8 * t), int(40 + 34 * t)))
+    f_title = ImageFont.truetype(bold, 54)
+    f_sub = ImageFont.truetype(reg, 28)
+    d.text((50, 30), "Конкурс по баллам", font=f_title, fill=(255, 255, 255))
+    d.text((52, 102), _fmt_full_date(start) + " — " + _fmt_full_date(end), font=f_sub, fill=(170, 180, 215))
+    base = H - 70
+    heights = {1: 250, 2: 190, 3: 150}
+    centers = {2: int(W * 0.22), 1: W // 2, 3: int(W * 0.78)}
+    colors = {1: (255, 215, 90), 2: (190, 200, 220), 3: (224, 140, 90)}
+    cw = 360
+    f_place = ImageFont.truetype(bold, 72)
+    f_word = ImageFont.truetype(bold, 26)
+    f_name = ImageFont.truetype(bold, 30)
+    f_pts = ImageFont.truetype(reg, 26)
+    for rank in (2, 1, 3):
+        cx = centers[rank]
+        top = base - heights[rank]
+        color = colors[rank]
+        d.rounded_rectangle((cx - cw // 2, top, cx + cw // 2, base), radius=24,
+                            fill=(29, 34, 66), outline=color, width=4)
+        num = str(rank)
+        nw = d.textlength(num, font=f_place)
+        d.text((cx - nw / 2, top + 34), num, font=f_place, fill=color)
+        ww = d.textlength("место", font=f_word)
+        d.text((cx - ww / 2, top + 122), "место", font=f_word, fill=color)
+        members = groups.get(rank) or []
+        names = ", ".join(m[0] for m in members) if members else "—"
+        pts = str(members[0][1]) if members else "0"
+        f_nm = _fit_font(d, names, bold, 30, cw - 30)
+        d.text((cx - d.textlength(names, font=f_nm) / 2, top - 44), names, font=f_nm, fill=(255, 255, 255))
+        ptext = pts + " баллов"
+        d.text((cx - d.textlength(ptext, font=f_pts) / 2, top - 82), ptext, font=f_pts, fill=(170, 180, 215))
+        if not members:
+            continue
+        dia = 110 if rank == 1 else 95
+        shown = members[:3]
+        extra = max(0, len(members) - len(shown))
+        gap = 12
+        total_w = len(shown) * dia + (len(shown) - 1) * gap
+        x0 = cx - total_w // 2
+        ay = max(170, top - 110 - dia)
+        for i, (nick, pts_, vid) in enumerate(shown):
+            ax = x0 + i * (dia + gap)
+            av = _avatar_image(vid)
+            if av is not None:
+                circle = _circle_avatar(av, dia)
+                img.paste(circle, (ax, ay), circle)
+                d = ImageDraw.Draw(img)
+            else:
+                d.ellipse((ax, ay, ax + dia, ay + dia), fill=(56, 64, 108), outline=color, width=3)
+                letter = (nick[:1] or "?").upper()
+                lw = d.textlength(letter, font=f_place)
+                d.text((ax + (dia - lw) / 2, ay + dia / 2 - 40), letter, font=f_place, fill=color)
+        if extra:
+            plus = "+" + str(extra)
+            pw = d.textlength(plus, font=f_word)
+            d.text((cx + total_w // 2 + 14, ay + dia // 2 - 16), plus, font=f_word, fill=(170, 180, 215))
+    buf = BytesIO()
+    img.save(buf, format="PNG", optimize=True)
+    buf.seek(0)
+    buf.name = "contest.png"
+    return buf
+def handle_contest_button(user_id, peer_id):
+    """Кнопка «Конкурс» / команда /конкурс от игрока: рейтинг текстом + картинка-пьедестал."""
+    start, end, items = contest_rating_rows()
+    if start is None:
+        reply(peer_id, "Конкурс ещё не запущен.", menu_keyboard())
+        return
+    ranked = contest_ranked(items)
+    today = today_local()
+    if today < start:
+        status = "ещё не начался"
+    elif today <= end:
+        status = "идёт"
+    else:
+        status = "закончился"
+    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
+    lines = [
+        "🏆 Конкурс " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (" + status + ")",
+        "",
+    ]
+    for rank, nick, n, pts, vid in ranked:
+        mark = medals.get(rank, str(rank) + ".")
+        lines.append(mark + " " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
+    reply_long(peer_id, "\n".join(lines))
+    try:
+        buf = render_contest_podium(start, end, ranked)
+        if buf:
+            upload = vk_api.VkUpload(vk_session)
+            ph = upload.photo_messages(photos=buf)[0]
+            att = "photo" + str(ph["owner_id"]) + "_" + str(ph["id"])
+            if ph.get("access_key"):
+                att += "_" + str(ph["access_key"])
+            vk.messages.send(peer_id=peer_id, message="🏆 Пьедестал конкурса 👆",
+                             attachment=att, random_id=get_random_id())
+    except Exception as e:
+        print("Конкурс: не удалось отправить пьедестал:", repr(e))
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
@@ -3731,6 +3964,7 @@ ADMIN_HELP = (
     "/конкурс 10.11.2026 20.11.2026 — запустить конкурс (даты начала и конца)\n"
     "/конкурс — показать текущий конкурс\n"
     "/конкурс стоп — остановить и сбросить\n"
+    "/напомнить — разослать всем игрокам напоминание о конкурсе\n"
     "/итоги — кто сколько заработал баллов за конкурс (оба списка, от большего к меньшему)\n\n"
     "Отчёты (нужен подключённый страничный бот + настройки места проверки):\n"
     "/отместо — показать где проверяются отчёты\n"
@@ -3821,6 +4055,7 @@ ADMIN_SECTIONS = [
         ("/конкурс 10.11 20.11", "Запустить конкурс (даты)"),
         ("/конкурс", "Показать текущий конкурс"),
         ("/конкурс стоп", "Остановить и сбросить"),
+        ("/напомнить", "Разослать всем напоминание"),
         ("/итоги", "Кто сколько заработал баллов"),
     ]),
     ("Рассылки", [
@@ -4209,6 +4444,12 @@ def handle(text, user_id, peer_id=0):
         return cmd_contest(args) if is_common else None
     if raw_cmd == "/итоги":
         return cmd_contest_results() if is_common else None
+    # /напомнить — рассылка всем привязанным игрокам о конкурсе (общие админы)
+    if raw_cmd == "/напомнить":
+        if not is_common:
+            return None
+        executor.submit(cmd_contest_remind)
+        return "📣 Отправляю напоминание всем привязанным игрокам..."
 
     # Кому не доходят сообщения бота: /кто (общие админы — оба списка, /вдв — только /нлист)
     if raw_cmd == "/кто":
@@ -4378,6 +4619,14 @@ def process_event(event):
             if payload.get("c") == "help" and is_any_admin(from_id):
                 send_admin_help(peer_id, from_id)
                 return
+            # кнопка «Конкурс» из рассылки о старте конкурса
+            if payload.get("c") == "contest":
+                try:
+                    handle_contest_button(from_id, peer_id)
+                except Exception as e:
+                    print("Ошибка кнопки «Конкурс»:", repr(e))
+                    reply(peer_id, "Произошла ошибка. Попробуйте позже.", menu_keyboard())
+                return
             try:
                 answer, kb = button_response(from_id, payload)
             except Exception as e:
@@ -4474,6 +4723,10 @@ def process_event(event):
             public_answer = "Покупки теперь через кнопки: нажмите «🛒 Магазин» в меню (если кнопок нет — напишите /меню)."
         elif raw_cmd in ("/топобщий", "/топ_общий"):
             public_answer = handle_top(from_id, None, ["общий"])
+        elif raw_cmd == "/конкурс" or raw_cmd == "/конкрус":
+            if not is_any_admin(from_id):
+                handle_contest_button(from_id, peer_id)
+                return
         elif command == "/топ":
             public_answer = handle_top(from_id, suffix, args)
         elif raw_cmd == "/я":
