@@ -4723,10 +4723,12 @@ def process_event(event):
             public_answer = "Покупки теперь через кнопки: нажмите «🛒 Магазин» в меню (если кнопок нет — напишите /меню)."
         elif raw_cmd in ("/топобщий", "/топ_общий"):
             public_answer = handle_top(from_id, None, ["общий"])
-        elif raw_cmd == "/конкурс" or raw_cmd == "/конкрус":
+        elif raw_cmd in ("/конкурс", "/конкрус"):
             if not is_any_admin(from_id):
                 handle_contest_button(from_id, peer_id)
                 return
+            # админ — пропускаем дальше, в админский обработчик handle()
+            is_public = False
         elif command == "/топ":
             public_answer = handle_top(from_id, suffix, args)
         elif raw_cmd == "/я":
