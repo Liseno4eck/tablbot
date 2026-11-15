@@ -1433,12 +1433,9 @@ def render_contest_podium(start, end, ranked):
         ww = d.textlength("место", font=f_word)
         d.text((cx - ww / 2, top + 122), "место", font=f_word, fill=color)
         members = groups.get(rank) or []
-        names = ", ".join(m[0] for m in members) if members else "—"
         pts = str(members[0][1]) if members else "0"
-        f_nm = _fit_font(d, names, bold, 30, cw - 30)
-        d.text((cx - d.textlength(names, font=f_nm) / 2, top - 44), names, font=f_nm, fill=(255, 255, 255))
         ptext = pts + " баллов"
-        d.text((cx - d.textlength(ptext, font=f_pts) / 2, top - 82), ptext, font=f_pts, fill=(170, 180, 215))
+        d.text((cx - d.textlength(ptext, font=f_pts) / 2, top - 44), ptext, font=f_pts, fill=(170, 180, 215))
         if not members:
             continue
         dia = 110 if rank == 1 else 95
