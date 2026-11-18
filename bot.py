@@ -93,6 +93,20 @@ REPORT_AWAIT_TIMEOUT = 1800
 page_lock = threading.Lock()
 PAGE_TIMEOUT = 240       # сколько секунд ждём результат проверки
 # ==========================================================
+# АНТИ-СПАМ
+#   Если один и тот же человек присылает пачку сообщений, бот отвечает
+#   только на первые SPAM_LIMIT штук, остальные молча игнорирует.
+#   Предупреждение («не спамьте») приходит ОДИН раз за заглушку.
+# ==========================================================
+SPAM_WINDOW = 5.0   # окно подсчёта сообщений, сек
+SPAM_LIMIT = 3      # сколько сообщений в окне ещё обрабатываем (обычным пользователям)
+SPAM_LIMIT_ADMIN = 8  # то же для админов: им нужно вводить команды подряд
+SPAM_MUTE = 8.0     # на сколько секунд заглушаем того, кто спамит
+spam_lock = threading.Lock()
+_spam_hits = {}       # user_id -> [ts, ...]
+_spam_muted = {}      # user_id -> ts, до которого игнорируем
+_spam_warned = {}     # user_id -> ts последней подсказки
+# ==========================================================
 # ГДЕ ПРОВЕРЯТЬ ОТЧЁТЫ: сообщество + два обсуждения (топика)
 # ==========================================================
 # Метка, которую страничный бот пишет в обсуждении после проверки.
@@ -1487,7 +1501,7 @@ def handle_contest_button(user_id, peer_id):
     """Кнопка «Конкурс» / команда /конкурс от игрока: рейтинг текстом + картинка-пьедестал."""
     start, end, items = contest_rating_rows()
     if start is None:
-        reply(peer_id, "Конкурс ещё не запущен.", menu_keyboard())
+        reply(peer_id, "Конкурс ещё не запущен.", menu_keyboard(user_id))
         return
     ranked = contest_ranked(items)
     today = today_local()
@@ -1502,10 +1516,10 @@ def handle_contest_button(user_id, peer_id):
         "🏆 Конкурс " + _fmt_full_date(start) + " — " + _fmt_full_date(end) + " (" + status + ")",
         "",
     ]
-    # в общем списке — сквозная нумерация 1, 2, 3, 4... (без разделения мест);
-    # на фото-пьедестале при этом остаются места 1-2-3 с совместными призёрами
-    for i, (nick, n, pts, vid) in enumerate(items, 1):
-        mark = medals.get(i, str(i) + ".")
+    # в общем списке места как на пьедестале: одинаковые баллы = одно место
+    # и одна и та же медаль у всех, кто его делит
+    for rank, nick, n, pts, vid in ranked:
+        mark = medals.get(rank, str(rank) + ".")
         lines.append(mark + " " + nick + " — " + str(pts) + " (" + LIST_TITLE[n] + ")")
     text = "\n".join(lines)
 
@@ -1545,6 +1559,194 @@ def _retry_contest_photo(peer_id, start, end, ranked):
                          attachment=att, random_id=get_random_id())
     except Exception as e:
         print("Конкурс: фоновая отправка фото не удалась:", repr(e))
+# ==========================================================
+# ПРИЗЫ КОНКУРСА: /призы — только владелец, только в ЛС
+#   1. владелец жмёт кнопку «🎁 Призы» (или пишет /призы)
+#   2. бот по очереди спрашивает приз для каждого места
+#   3. когда призы заданы — спрашивает «делаем рассылку?» (кнопки Да/Нет)
+#   4. на «Да»: каждому призёру приходит сначала полный список победителей
+#      с их призами, вторым сообщением — его место, его приз и инструкция
+#      «для выдачи напишите /написать и ваш ник»
+#   Рассылка идёт всем призёрам, независимо от того, к какому списку
+#   (/список или /нлист) привязан игрок.
+# ==========================================================
+PRIZE_FLOW = {}            # peer_id -> состояние диалога про призы
+PRIZE_FLOW_TIMEOUT = 1800  # сколько секунд живёт диалог
+PRIZE_MAX_PLACES = 10      # за сколько мест максимум спрашиваем приз
+PRIZE_STOP_WORDS = {"стоп", "хватит", "готово", "все", "всё", "ok", "ок", "done", "stop"}
+PRIZE_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+def prizes_start_keyboard():
+    kb = VkKeyboard(inline=True)
+    btn(kb, "🎁 Призы", "prizes", VkKeyboardColor.PRIMARY)
+    return kb.get_keyboard()
+def prize_yes_no_keyboard():
+    """Инлайн «Да / Нет» для вопроса про рассылку призов."""
+    kb = VkKeyboard(inline=True)
+    btn(kb, "✅ Да", "prize_answer", VkKeyboardColor.POSITIVE, a="broadcast", v="yes")
+    btn(kb, "❌ Нет", "prize_answer", VkKeyboardColor.NEGATIVE, a="broadcast", v="no")
+    return kb.get_keyboard()
+def _prize_places(ranked):
+    places = []
+    for rank, nick, n, pts, vid in ranked:
+        if rank not in places:
+            places.append(rank)
+    return places
+def _prize_ask(peer_id):
+    """Вопрос «какой приз за N место?»."""
+    st = PRIZE_FLOW[peer_id]
+    place = st["places"][st["next"]]
+    sharing = [r[1] for r in st["rows"] if r[0] == place]
+    who = ""
+    if len(sharing) > 1:
+        names = ", ".join(sharing[:8]) + ("…" if len(sharing) > 8 else "")
+        who = "\nЕго делят " + str(len(sharing)) + " игроков: " + names
+    return (
+        "🎁 Приз за " + str(place) + " место (" + str(st["next"] + 1) + "/"
+        + str(len(st["places"])) + "):" + who
+        + "\nНапишите обычным сообщением, что получает этот победитель:"
+    )
+def start_prize_flow(peer_id):
+    """Открывает диалог про призы. Возвращает (текст, клавиатура)."""
+    _, _, items = contest_rating_rows()
+    ranked = contest_ranked(items)
+    if not ranked:
+        return "🎁 Конкурс ещё не запущен (или нет участников) — призы выдавать некому.", None
+    places = _prize_places(ranked)
+    shown = places[:PRIZE_MAX_PLACES]
+    with lock:
+        PRIZE_FLOW[peer_id] = {
+            "rows": ranked, "places": shown, "next": 0, "prizes": {},
+            "stage": "ask_prize", "msg_id": None, "ts": time.time(),
+        }
+    note = ""
+    if len(places) > len(shown):
+        note = "\n(спрашиваю призы максимум за " + str(PRIZE_MAX_PLACES) + " мест)\n"
+    return (
+        "🎁 Призы конкурса: мест в рейтинге — " + str(len(places)) + ".\n"
+        "Я по очереди спрошу приз для каждого места, потом спрошу, делать ли рассылку.\n"
+        "Чтобы закончить раньше — напишите «стоп»." + note + "\n" + _prize_ask(peer_id)
+    ), None
+def _prize_confirm(peer_id, st):
+    """Сводка призов + вопрос «делаем рассылку?»."""
+    prizes = st["prizes"]
+    lines = ["🎁 Призы заданы:", ""]
+    for place in sorted(prizes):
+        sharing = [r[1] for r in st["rows"] if r[0] == place]
+        mark = PRIZE_MEDALS.get(place, str(place) + ".")
+        lines.append(mark + " " + str(place) + " место — " + prizes[place]
+                     + " (" + ", ".join(sharing) + ")")
+    lines.append("")
+    lines.append("📣 Делаем рассылку?")
+    q = "\n".join(lines)
+    with lock:
+        st["stage"] = "ask_broadcast"
+        st["question"] = q
+        st["msg_id"] = None
+        st["ts"] = time.time()
+    return q, prize_yes_no_keyboard()
+def prize_flow_answer(peer_id, text):
+    """Ответ владельца в диалоге про призы. Возвращает (текст, клавиатура) или None."""
+    st = PRIZE_FLOW.get(peer_id)
+    if st is None:
+        return None
+    if time.time() - st.get("ts", 0) > PRIZE_FLOW_TIMEOUT:
+        with lock:
+            PRIZE_FLOW.pop(peer_id, None)
+        return "⌛ Диалог про призы устарел. Начните заново: /призы", None
+    if st.get("stage") == "ask_broadcast":
+        return "👆 Ответьте кнопкой под сообщением: «Да» или «Нет».", None
+    answer = text.strip()
+    if not answer:
+        return _prize_ask(peer_id), None
+    if answer.lower() in PRIZE_STOP_WORDS:
+        if not st["prizes"]:
+            with lock:
+                PRIZE_FLOW.pop(peer_id, None)
+            return "🎁 Призы не заданы — диалог закрыт. Начать заново: /призы", None
+        return _prize_confirm(peer_id, st)
+    place = st["places"][st["next"]]
+    with lock:
+        st["prizes"][place] = answer
+        st["next"] += 1
+        st["ts"] = time.time()
+    if st["next"] >= len(st["places"]):
+        return _prize_confirm(peer_id, st)
+    return _prize_ask(peer_id), None
+def handle_prize_button(user_id, peer_id, payload):
+    """Кнопки «Да/Нет» под вопросом про рассылку призов."""
+    if user_id != OWNER_ID:
+        return "🎁 Управлять призами может только владелец.", menu_keyboard(user_id)
+    st = PRIZE_FLOW.get(peer_id)
+    if st is None or st.get("stage") != "ask_broadcast":
+        return "На этот вопрос уже ответили. Начать заново: /призы", menu_keyboard(user_id)
+    if str(payload.get("v") or "") != "yes":
+        close_question(peer_id, st, "❌ Ответ: Нет — рассылку не делаю.")
+        with lock:
+            PRIZE_FLOW.pop(peer_id, None)
+        return "❌ Ок, рассылку призов не делаю. Задать заново: /призы", menu_keyboard(user_id)
+    close_question(peer_id, st, "✅ Ответ: Да — делаю рассылку.")
+    with lock:
+        PRIZE_FLOW.pop(peer_id, None)
+    executor.submit(prize_broadcast, peer_id, st)
+    return "📣 Делаю рассылку призов победителям конкурса...", menu_keyboard(user_id)
+def _prize_send(user_id, text):
+    try:
+        vk.messages.send(user_id=user_id, message=text, random_id=get_random_id())
+        return True
+    except Exception as e:
+        print("Призы: не удалось отправить " + str(user_id) + ":", repr(e))
+        return False
+def prize_broadcast(peer_id, st):
+    """Рассылка: сначала полный список победителей с призами, затем личное сообщение."""
+    prizes = st.get("prizes") or {}
+    rows = st.get("rows") or []
+    if not prizes:
+        reply(peer_id, "🎁 Призы не заданы — рассылку не делаю.")
+        return
+    lines = ["🏆 Итоги конкурса и призы:", ""]
+    winners = {}
+    for rank, nick, n, pts, vid in rows:
+        prize = prizes.get(rank)
+        if not prize:
+            continue
+        mark = PRIZE_MEDALS.get(rank, str(rank) + ".")
+        lines.append(mark + " " + str(rank) + " место — " + nick + " (" + LIST_TITLE[n] + "): "
+                     + str(pts) + " баллов → " + prize)
+        if vid > 0:
+            winners.setdefault(vid, []).append((rank, nick, prize))
+    if not winners:
+        reply(peer_id, "🎁 Не нашёл победителей с VK ID — рассылку сделать не могу.")
+        return
+    chunks = split_long_text("\n".join(lines))
+    sent = 0
+    failed = []
+    for vid, entries in winners.items():
+        ok = True
+        for chunk in chunks:
+            if not _prize_send(vid, chunk):
+                ok = False
+                break
+            time.sleep(0.1)
+        nicks = []
+        parts = []
+        for rank, nick, prize in sorted(entries):
+            parts.append("🎉 Вы заняли " + str(rank) + " место. Ваш приз: " + prize)
+            if nick not in nicks:
+                nicks.append(nick)
+        personal = "\n".join(parts) + (
+            "\n\nДля выдачи напишите команду /написать и ваш ник (" + ", ".join(nicks) + ")."
+        )
+        if not _prize_send(vid, personal):
+            ok = False
+        if ok:
+            sent += 1
+        else:
+            failed.extend(nick for _, nick, _ in entries)
+        time.sleep(0.1)
+    out = ["📣 Рассылка призов завершена: отправлено " + str(sent) + " из " + str(len(winners)) + "."]
+    if failed:
+        out.append("⚠️ Не дошло: " + ", ".join(dict.fromkeys(failed)))
+    reply_long(peer_id, "\n".join(out))
 # ==========================================================
 # ВЫДАТЬ / ЗАБРАТЬ
 # ==========================================================
@@ -2023,46 +2225,76 @@ def _last_admin_for(from_id):
     if last and (last in ALLOWED_IDS or last in NADMIN_IDS):
         return last
     return OWNER_ID
+def _write_targets(from_id):
+    """Кому уходит обращение из /написать.
+    1) админ, который последний писал этому игроку;
+    2) игрок только из /нлист — админам /вдв;
+    3) иначе — владельцу."""
+    last = _last_admin_for(from_id)
+    with lock:
+        in1 = find_by_id(1, from_id) is not None
+        in2 = find_by_id(2, from_id) is not None
+    if in2 and not in1:
+        # пользователь списка /нлист: пишем админам, полученным через /вдв
+        if last != OWNER_ID and (last in NADMIN_IDS or last in ALLOWED_IDS):
+            return [last]
+        nadmins = list(NADMIN_IDS)
+        if nadmins:
+            return nadmins
+        return [OWNER_ID]
+    return [last]
+def _player_lists_tag(from_id):
+    """Подпись в обращении: в каких списках привязан игрок."""
+    with lock:
+        tags = [LIST_TITLE[n] for n in (1, 2) if find_by_id(n, from_id) is not None]
+    return " + ".join(tags) if tags else "не привязан"
 def cmd_write(msg, from_id, text):
     parts = text.strip().split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         return "Формат: /написать текст"
     body_text = parts[1].strip()
-    target_admin = _last_admin_for(from_id)
+    targets = _write_targets(from_id)
     name = get_user_name(from_id)
     kb = VkKeyboard(inline=True)
     kb.add_openlink_button("💬 В чат", "https://vk.com/gim" + str(GROUP_ID) + "?sel=" + str(from_id))
     keyboard = kb.get_keyboard()
-    header = "📩 Сообщение от [id" + str(from_id) + "|" + name + "]"
-    sent = False
+    header = ("📩 Сообщение от [id" + str(from_id) + "|" + name + "] ("
+              + _player_lists_tag(from_id) + ")")
     cmid = msg.get("conversation_message_id")
-    if cmid:
-        try:
-            vk.messages.send(
-                user_id=target_admin,
-                message=header,
-                random_id=get_random_id(),
-                keyboard=keyboard,
-                forward=json.dumps({
-                    "peer_id": msg["peer_id"],
-                    "conversation_message_ids": [cmid],
-                    "is_reply": False,
-                }),
-            )
-            sent = True
-        except Exception as e:
-            print("Не удалось переслать обращение, отправляю текстом:", repr(e))
-    if not sent:
-        try:
-            vk.messages.send(
-                user_id=target_admin,
-                message=header + ":\n\n" + body_text,
-                random_id=get_random_id(),
-                keyboard=keyboard,
-            )
-        except Exception as e:
-            print("Ошибка отправки обращения:", repr(e))
-            return "Не удалось отправить сообщение. Попробуйте позже."
+    delivered = 0
+    for target_admin in targets:
+        sent = False
+        if cmid:
+            try:
+                vk.messages.send(
+                    user_id=target_admin,
+                    message=header,
+                    random_id=get_random_id(),
+                    keyboard=keyboard,
+                    forward=json.dumps({
+                        "peer_id": msg["peer_id"],
+                        "conversation_message_ids": [cmid],
+                        "is_reply": False,
+                    }),
+                )
+                sent = True
+            except Exception as e:
+                print("Не удалось переслать обращение, отправляю текстом:", repr(e))
+        if not sent:
+            try:
+                vk.messages.send(
+                    user_id=target_admin,
+                    message=header + ":\n\n" + body_text,
+                    random_id=get_random_id(),
+                    keyboard=keyboard,
+                )
+                sent = True
+            except Exception as e:
+                print("Ошибка отправки обращения:", repr(e))
+        if sent:
+            delivered += 1
+    if not delivered:
+        return "Не удалось отправить сообщение. Попробуйте позже."
     return "✅ Ваше сообщение отправлено."
 # ==========================================================
 # /ответить — ответ админа на обращение (/написать)
@@ -3585,7 +3817,7 @@ def btn(kb, label, c, color=VkKeyboardColor.SECONDARY, **extra):
     payload = {"c": c}
     payload.update(extra)
     kb.add_button(label[:40], color=color, payload=payload)
-def menu_keyboard():
+def menu_keyboard(for_id=None):
     kb = VkKeyboard(one_time=False)
     btn(kb, "🛒 Магазин", "shop", VkKeyboardColor.PRIMARY)
     btn(kb, "💰 Мои баллы", "points", VkKeyboardColor.POSITIVE)
@@ -3595,6 +3827,10 @@ def menu_keyboard():
     btn(kb, "🏆 Конкурс", "contest", VkKeyboardColor.PRIMARY)
     kb.add_line()
     btn(kb, "❓ Помощь", "help")
+    if for_id == OWNER_ID:
+        # владельцу показываем кнопку призов (спросить призы и сделать рассылку)
+        kb.add_line()
+        btn(kb, "🎁 Призы", "prizes", VkKeyboardColor.SECONDARY)
     return kb.get_keyboard()
 def choice_keyboard(options):
     """options: список (label, c, extra_dict). Внизу всегда «Назад»."""
@@ -3622,7 +3858,7 @@ def shop_view(user_id, n, page=0):
         shop = list(S(n))
         player = find_by_id(n, user_id)
     if not shop:
-        return "Магазин пуст.", menu_keyboard()
+        return "Магазин пуст.", menu_keyboard(user_id)
     items = sorted(enumerate(shop), key=lambda t: (t[1]["price"], t[0]))
     pages = max(1, (len(items) + SHOP_PER_PAGE - 1) // SHOP_PER_PAGE)
     page = max(0, min(page, pages - 1))
@@ -3658,9 +3894,9 @@ def item_view(user_id, n, idx, pg):
     with lock:
         player = find_by_id(n, user_id)
         if player is None:
-            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard(user_id)
         if player.get("vac_stage"):
-            return "Сначала завершите оформление отпуска: ответьте на вопрос бота.", menu_keyboard()
+            return "Сначала завершите оформление отпуска: ответьте на вопрос бота.", menu_keyboard(user_id)
         shop = S(n)
         if idx < 0 or idx >= len(shop):
             text, kb = shop_view(user_id, n, 0)
@@ -3783,13 +4019,13 @@ def button_response(user_id, payload):
     c = payload.get("c")
 
     if c == "menu":
-        return MENU_TEXT, menu_keyboard()
+        return MENU_TEXT, menu_keyboard(user_id)
 
     if c == "points":
-        return points_text(user_id), menu_keyboard()
+        return points_text(user_id), menu_keyboard(user_id)
 
     if c == "help":
-        return cmd_help(user_id), menu_keyboard()
+        return cmd_help(user_id), menu_keyboard(user_id)
 
     if c == "shop":
         lists = user_lists(user_id)
@@ -3819,14 +4055,14 @@ def button_response(user_id, payload):
             _int(payload.get("p"), -1),
             _int(payload.get("h"), -1),
         )
-        return answer, menu_keyboard()
+        return answer, menu_keyboard(user_id)
 
     if c == "top":
         lists = top_lists(user_id)
         if not lists:
-            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard(user_id)
         if len(lists) == 1:
-            return cmd_top(lists[0]), menu_keyboard()
+            return cmd_top(lists[0]), menu_keyboard(user_id)
         return "Какой топ показать?", choice_keyboard([
             ("🏆 Топ /список", "top_n", {"l": 1}),
             ("🏆 Топ /нлист", "top_n", {"l": 2}),
@@ -3837,15 +4073,15 @@ def button_response(user_id, payload):
         n = _int(payload.get("l"), 0)
         lists = top_lists(user_id)
         if n not in (1, 2) or (n not in lists and user_id not in ALLOWED_IDS):
-            return "Нет доступа к этому списку.", menu_keyboard()
-        return cmd_top(n), menu_keyboard()
+            return "Нет доступа к этому списку.", menu_keyboard(user_id)
+        return cmd_top(n), menu_keyboard(user_id)
 
     if c == "top_all":
         if not top_lists(user_id):
-            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard()
-        return cmd_top_all(), menu_keyboard()
+            return "Вы не привязаны к нику. Обратитесь к администратору.", menu_keyboard(user_id)
+        return cmd_top_all(), menu_keyboard(user_id)
 
-    return MENU_TEXT, menu_keyboard()
+    return MENU_TEXT, menu_keyboard(user_id)
 # ==========================================================
 # ОТПУСК: диалог после покупки (кол-во дней -> включительно да/нет)
 # ==========================================================
@@ -4007,7 +4243,8 @@ ADMIN_HELP = (
     "/конкурс — показать текущий конкурс\n"
     "/конкурс стоп — остановить и сбросить\n"
     "/напомнить — разослать всем игрокам напоминание о конкурсе\n"
-    "/итоги — кто сколько заработал баллов за конкурс (оба списка, от большего к меньшему)\n\n"
+    "/итоги — кто сколько заработал баллов за конкурс (оба списка, от большего к меньшему)\n"
+    "/призы — (только владелец, в ЛС) спросить приз для каждого места и разослать победителям\n\n"
     "Отчёты (нужен подключённый страничный бот + настройки места проверки):\n"
     "/отместо — показать где проверяются отчёты\n"
     "/отгруппа 123456 — ID сообщества, где лежат отчёты\n"
@@ -4099,6 +4336,7 @@ ADMIN_SECTIONS = [
         ("/конкурс стоп", "Остановить и сбросить"),
         ("/напомнить", "Разослать всем напоминание"),
         ("/итоги", "Кто сколько заработал баллов"),
+        ("/призы", "Призы по местам + рассылка (владелец)"),
     ]),
     ("Рассылки", [
         ("/разослать1|2 текст", "Всем игрокам списка"),
@@ -4165,11 +4403,11 @@ NADMIN_SECTIONS = [
 ]
 ADMIN_CAPTION = (
     "📖 Пояснения к командам\n\n"
-    "• Томас лох"
+    "• Команды"
 )
 NADMIN_CAPTION = (
     "📖 Пояснения к командам\n\n"
-    "Томас лох"
+    "• Команды"
 )
 # ---------- шрифты ----------
 _FONT_PATHS = {
@@ -4618,6 +4856,38 @@ def parse_payload(msg):
     return parsed if isinstance(parsed, dict) else None
 def is_any_admin(user_id):
     return user_id in ALLOWED_IDS or user_id in NADMIN_IDS
+def spam_check(user_id):
+    """Анти-спам. Возвращает 'ok' (сообщение обрабатываем),
+    'warn' (спам — сказать один раз, что не надо спамить)
+    или 'drop' (спам — молча игнорируем)."""
+    if user_id <= 0:
+        return "ok"
+    # страничный бот шлёт результаты частями — его не глушим
+    if is_page_connected() and user_id == get_page_user_id():
+        return "ok"
+    now = time.time()
+    with spam_lock:
+        if now < _spam_muted.get(user_id, 0):
+            return "drop"
+        hits = [t for t in _spam_hits.get(user_id, ()) if now - t <= SPAM_WINDOW]
+        hits.append(now)
+        _spam_hits[user_id] = hits
+        limit = SPAM_LIMIT_ADMIN if is_any_admin(user_id) else SPAM_LIMIT
+        if len(hits) <= limit:
+            return "ok"
+        # спам: заглушаем и обнуляем счётчик, чтобы после заглушки снова были SPAM_LIMIT сообщений
+        _spam_muted[user_id] = now + SPAM_MUTE
+        _spam_hits[user_id] = []
+        # чистим память за давно молчавшими
+        if len(_spam_hits) > 2000:
+            for uid in [u for u, h in _spam_hits.items() if not h or now - h[-1] > SPAM_WINDOW * 4]:
+                _spam_hits.pop(uid, None)
+                _spam_muted.pop(uid, None)
+                _spam_warned.pop(uid, None)
+        if now - _spam_warned.get(user_id, 0) > SPAM_MUTE:
+            _spam_warned[user_id] = now
+            return "warn"
+        return "drop"
 def process_event(event):
     if event.type != VkBotEventType.MESSAGE_NEW:
         return
@@ -4629,6 +4899,14 @@ def process_event(event):
     payload = parse_payload(msg)
     if DEBUG:
         print("Сообщение от " + str(from_id) + ": " + repr(text) + " payload=" + repr(payload))
+
+    # === АНТИ-СПАМ: пачку сообщений обрабатываем один раз, остальное игнор ===
+    verdict = spam_check(from_id)
+    if verdict != "ok":
+        if verdict == "warn":
+            reply(peer_id, "🛑 Не спамьте, пожалуйста: сообщения подряд бот не обрабатывает. "
+                           "Подождите пару секунд и напишите ещё раз.")
+        return
 
     # Запоминаем всех, кто пишет боту в ЛС (для /рассылка)
     is_new = register_contact(from_id) if is_dm else False
@@ -4651,10 +4929,23 @@ def process_event(event):
                         st["msg_id"] = new_id
         return
 
+    # === Кнопка «🎁 Призы» и ответ «Да/Нет» на вопрос про рассылку призов (только ЛС) ===
+    if payload and payload.get("c") == "prizes":
+        if not is_dm or from_id != OWNER_ID:
+            reply(peer_id, "🎁 Команда /призы доступна только владельцу в ЛС.")
+            return
+        answer, kb = start_prize_flow(peer_id)
+        reply(peer_id, answer, kb)
+        return
+    if payload and payload.get("c") == "prize_answer":
+        answer, kb = handle_prize_button(from_id, peer_id, payload)
+        reply(peer_id, answer, kb)
+        return
+
     # === Нажатия на кнопки (только ЛС) ===
     if is_dm and payload:
         if payload.get("command") == "start":
-            reply(peer_id, WELCOME_TEXT, menu_keyboard())
+            reply(peer_id, WELCOME_TEXT, menu_keyboard(from_id))
             return
         if payload.get("c"):
             # админам кнопка «Помощь» тоже показывает картинку
@@ -4667,19 +4958,19 @@ def process_event(event):
                     handle_contest_button(from_id, peer_id)
                 except Exception as e:
                     print("Ошибка кнопки «Конкурс»:", repr(e))
-                    reply(peer_id, "Произошла ошибка. Попробуйте позже.", menu_keyboard())
+                    reply(peer_id, "Произошла ошибка. Попробуйте позже.", menu_keyboard(from_id))
                 return
             try:
                 answer, kb = button_response(from_id, payload)
             except Exception as e:
                 print("Ошибка кнопки:", repr(e))
-                answer, kb = "Произошла ошибка. Попробуйте позже.", menu_keyboard()
+                answer, kb = "Произошла ошибка. Попробуйте позже.", menu_keyboard(from_id)
             reply(peer_id, answer, kb)
             return
 
     # === «Начать» / /меню ===
     if is_dm and text.lower() in START_WORDS:
-        reply(peer_id, WELCOME_TEXT if is_new else MENU_TEXT, menu_keyboard())
+        reply(peer_id, WELCOME_TEXT if is_new else MENU_TEXT, menu_keyboard(from_id))
         return
 
     # === Секретная команда +токен (только в ЛС; в /help не светится) ===
@@ -4711,6 +5002,23 @@ def process_event(event):
     # === Диалог отпуска: игрок пишет дату, затем да/нет (без команды) ===
     if not text.startswith("/"):
         handled = False
+        # === Диалог про призы: владелец обычным сообщением пишет призы ===
+        if is_dm and from_id == OWNER_ID:
+            with lock:
+                pflow = PRIZE_FLOW.get(peer_id)
+            if pflow is not None:
+                res = prize_flow_answer(peer_id, text)
+                if res is not None:
+                    answer, kb = res
+                    new_id = reply(peer_id, answer, kb)
+                    if kb and new_id:
+                        with lock:
+                            st_now = PRIZE_FLOW.get(peer_id)
+                            if st_now is not None:
+                                st_now["msg_id"] = new_id
+                    handled = True
+        if handled:
+            return
         with lock:
             for n in (1, 2):
                 player = find_by_id(n, from_id)
@@ -4722,12 +5030,12 @@ def process_event(event):
                     break
         # новый пользователь написал что угодно — сразу показываем кнопки
         if is_dm and is_new and not handled:
-            reply(peer_id, WELCOME_TEXT, menu_keyboard())
+            reply(peer_id, WELCOME_TEXT, menu_keyboard(from_id))
         return
 
     # новый пользователь начал с команды — тоже показываем кнопки
     if is_dm and is_new:
-        reply(peer_id, WELCOME_TEXT, menu_keyboard())
+        reply(peer_id, WELCOME_TEXT, menu_keyboard(from_id))
 
     # ======================================================
     # ПУБЛИЧНЫЕ КОМАНДЫ (доступны всем)
@@ -4777,6 +5085,21 @@ def process_event(event):
             public_answer = "Ваш VK ID: " + str(from_id)
         elif raw_cmd == "/написать":
             public_answer = cmd_write(msg, from_id, text)
+        elif raw_cmd in ("/призы", "/приз"):
+            if not is_dm or from_id != OWNER_ID:
+                return
+            if args and args[0].lower() in ("стоп", "отмена", "сброс", "stop"):
+                with lock:
+                    pflow = PRIZE_FLOW.pop(peer_id, None)
+                if pflow is not None:
+                    close_question(peer_id, pflow, "⏭ Диалог закрыт командой /призы стоп.")
+                public_answer = "🎁 Диалог про призы закрыт. Начать заново: /призы"
+            else:
+                public_answer = (
+                    "🎁 Призы конкурса. Нажмите кнопку 👇 — я спрошу приз для каждого места, "
+                    "а потом спрошу, делать ли рассылку."
+                )
+                public_keyboard = prizes_start_keyboard()
         elif raw_cmd in ("/ответить", "/ответ"):
             public_answer = cmd_reply_to_user(msg, from_id, text)
         else:
